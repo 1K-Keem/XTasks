@@ -125,7 +125,7 @@ npm run dev
 
 Ứng dụng sẽ mở tại: **http://localhost:3000**
 
-> **Lưu ý**: Script `dev` tự động xóa các tiến trình trên port 3000-3003 trước khi khởi động
+> **Lưu ý**: Script `dev` tự động xóa các tiến trình trên port 3000 trước khi khởi động
 
 ## Deployment
 
