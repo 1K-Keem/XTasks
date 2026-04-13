@@ -97,7 +97,7 @@ GRANT ALL PRIVILEGES ON DATABASE xtasks TO xtasks_user;
 ### 1. Clone Repository
 ```bash
 git clone <repo-url>
-cd ass
+cd XTasks
 ```
 
 ### 2. Cài Đặt Dependencies
