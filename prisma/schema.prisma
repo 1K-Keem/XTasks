@@ -1,0 +1,57 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String     @id @default(cuid())
+  email     String     @unique
+  password  String
+  name      String?
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+  tasks     Task[]
+  links     TaskLink[]
+}
+
+model Task {
+  id          String     @id @default(cuid())
+  title       String
+  description String?
+  completed   Boolean    @default(false)
+  userId      String
+  user        User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  parentId    String?
+  parent      Task?      @relation("TaskChildren", fields: [parentId], references: [id], onDelete: Cascade)
+  children    Task[]     @relation("TaskChildren")
+  x           Int?       @default(0)
+  y           Int?       @default(0)
+  linksFrom   TaskLink[] @relation("LinkFrom")
+  linksTo     TaskLink[] @relation("LinkTo")
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+
+  @@index([userId])
+  @@index([parentId])
+}
+
+model TaskLink {
+  id        String   @id @default(cuid())
+  fromId    String
+  from      Task     @relation("LinkFrom", fields: [fromId], references: [id], onDelete: Cascade)
+  toId      String
+  to        Task     @relation("LinkTo", fields: [toId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@unique([fromId, toId])
+  @@index([userId])
+}
