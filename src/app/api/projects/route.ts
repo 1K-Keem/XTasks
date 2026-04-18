@@ -23,16 +23,22 @@ export async function GET() {
 export async function POST(request: Request) {
   const session = await getServerSession(authOptions)
   if (!session?.user?.id) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  const payload = createProjectSchema.parse(await request.json())
-  const project = await prisma.project.create({
-    data: { name: payload.name, ownerId: session.user.id },
-  })
-  await prisma.projectMember.create({
-    data: {
-      userId: session.user.id,
-      projectId: project.id,
-      role: 'owner',
-    },
-  })
-  return NextResponse.json({ project: { id: project.id, name: project.name, role: 'owner' } })
+  try {
+    const payload = createProjectSchema.parse(await request.json())
+    const project = await prisma.project.create({
+      data: { name: payload.name, ownerId: session.user.id },
+    })
+    await prisma.projectMember.create({
+      data: {
+        userId: session.user.id,
+        projectId: project.id,
+        role: 'owner',
+      },
+    })
+    return NextResponse.json({ project: { id: project.id, name: project.name, role: 'owner' } })
+  } catch (err: any) {
+    if (err?.name === 'ZodError') return NextResponse.json({ error: 'Invalid request.' }, { status: 400 })
+    console.error(err)
+    return NextResponse.json({ error: 'Internal server error.' }, { status: 500 })
+  }
 }

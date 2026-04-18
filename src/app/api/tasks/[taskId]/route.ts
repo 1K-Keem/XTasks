@@ -33,41 +33,47 @@ export async function PATCH(request: Request, { params }: { params: { taskId: st
   const task = await getAuthorizedTask(params.taskId, session.user.id)
   if (!task) return NextResponse.json({ error: 'Not found' }, { status: 404 })
 
-  const payload = updateSchema.parse(await request.json())
-  const { dependencyIds, ...patch } = payload
+  try {
+    const payload = updateSchema.parse(await request.json())
+    const { dependencyIds, ...patch } = payload
 
-  const updated = await prisma.task.update({
-    where: { id: params.taskId },
-    data: {
-      ...patch,
-      assigneeId: payload.assigneeId === null ? null : payload.assigneeId,
-    },
-  })
-
-  if (dependencyIds) {
-    const tasks = await prisma.task.findMany({
-      where: { projectId: task.projectId },
-      select: { id: true },
+    const updated = await prisma.task.update({
+      where: { id: params.taskId },
+      data: {
+        ...patch,
+        assigneeId: payload.assigneeId === null ? null : payload.assigneeId,
+      },
     })
-    const deps = await prisma.dependency.findMany({
-      where: { task: { projectId: task.projectId }, NOT: { taskId: params.taskId } },
-      select: { taskId: true, dependsOnTaskId: true },
-    })
-    const testEdges = dependencyIds.map((id) => ({ taskId: params.taskId, dependsOnTaskId: id }))
-    const allEdges = [...deps, ...testEdges]
-    if (dependencyIds.some((id) => wouldCreateCycle(tasks, allEdges, params.taskId, id))) {
-      return NextResponse.json({ error: 'Dependency introduces a cycle.' }, { status: 400 })
-    }
 
-    await prisma.dependency.deleteMany({ where: { taskId: params.taskId } })
-    if (dependencyIds.length > 0) {
-      await prisma.dependency.createMany({
-        data: dependencyIds.map((dependsOnTaskId) => ({ taskId: params.taskId, dependsOnTaskId })),
+    if (dependencyIds) {
+      const tasks = await prisma.task.findMany({
+        where: { projectId: task.projectId },
+        select: { id: true },
       })
-    }
-  }
+      const deps = await prisma.dependency.findMany({
+        where: { task: { projectId: task.projectId }, NOT: { taskId: params.taskId } },
+        select: { taskId: true, dependsOnTaskId: true },
+      })
+      const testEdges = dependencyIds.map((id) => ({ taskId: params.taskId, dependsOnTaskId: id }))
+      const allEdges = [...deps, ...testEdges]
+      if (dependencyIds.some((id) => wouldCreateCycle(tasks, allEdges, params.taskId, id))) {
+        return NextResponse.json({ error: 'Dependency introduces a cycle.' }, { status: 400 })
+      }
 
-  return NextResponse.json({ task: updated })
+      await prisma.dependency.deleteMany({ where: { taskId: params.taskId } })
+      if (dependencyIds.length > 0) {
+        await prisma.dependency.createMany({
+          data: dependencyIds.map((dependsOnTaskId) => ({ taskId: params.taskId, dependsOnTaskId })),
+        })
+      }
+    }
+
+    return NextResponse.json({ task: updated })
+  } catch (err: any) {
+    if (err?.name === 'ZodError') return NextResponse.json({ error: 'Invalid request.' }, { status: 400 })
+    console.error(err)
+    return NextResponse.json({ error: 'Internal server error.' }, { status: 500 })
+  }
 }
 
 export async function DELETE(_: Request, { params }: { params: { taskId: string } }) {

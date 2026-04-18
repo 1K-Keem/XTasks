@@ -86,9 +86,9 @@ export default async function DashboardPage() {
         assigneeId: task.assigneeId ?? session.user.id,
         status: task.status as 'todo' | 'in_progress' | 'done' | 'blocked',
         dependencyIds: task.dependencies.map((dep) => dep.dependsOnTaskId),
-        subtasks: JSON.parse(task.subtasksJson || '[]') as { id: string; title: string; done: boolean }[],
+        subtasks: (() => { try { return JSON.parse(task.subtasksJson || '[]') as { id: string; title: string; done: boolean }[] } catch { return [] } })(),
         notes: task.description ?? '',
-        comments: JSON.parse(task.commentsJson || '[]') as string[],
+        comments: (() => { try { return JSON.parse(task.commentsJson || '[]') as string[] } catch { return [] } })(),
         createdAt: task.createdAt.getTime(),
       }))}
     />

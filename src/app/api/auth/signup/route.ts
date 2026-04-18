@@ -38,7 +38,9 @@ export async function POST(request: Request) {
       })
     }
     return NextResponse.json({ id: user.id })
-  } catch {
-    return NextResponse.json({ error: 'Invalid signup request.' }, { status: 400 })
+  } catch (err: any) {
+    if (err?.name === 'ZodError') return NextResponse.json({ error: 'Invalid signup request.' }, { status: 400 })
+    console.error(err)
+    return NextResponse.json({ error: 'Internal server error.' }, { status: 500 })
   }
 }

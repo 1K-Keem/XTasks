@@ -507,39 +507,55 @@ export default function XTasksApp({
     if (state.activeProjectId) {
       // Fetch tasks for the active project
       fetch(`/api/projects/${state.activeProjectId}/tasks`)
-        .then((res) => res.json())
+        .then((res) => {
+          if (!res.ok) throw new Error(`Failed to fetch tasks: ${res.status}`)
+          return res.json()
+        })
         .then((data) => {
-        const tasks = data.tasks.map((task: any) => ({
-          id: task.id,
-          title: task.title,
-          duration: task.durationDays,
-          assigneeId: task.assigneeId ?? state.currentUserId,
-          status: task.status as TaskStatus,
-          dependencyIds: task.dependencies.map((dep: any) => dep.dependsOnTaskId),
-          subtasks: JSON.parse(task.subtasksJson || '[]'),
-          notes: task.description ?? '',
-          comments: JSON.parse(task.commentsJson || '[]'),
-          createdAt: new Date(task.createdAt).getTime(),
-        }))
-        dispatch({ type: 'loadTasks', tasks })
-      })
+          const tasks = (data?.tasks ?? []).map((task: any) => ({
+            id: task.id,
+            title: task.title,
+            duration: task.durationDays,
+            assigneeId: task.assigneeId ?? state.currentUserId,
+            status: task.status as TaskStatus,
+            dependencyIds: (task.dependencies ?? []).map((dep: any) => dep.dependsOnTaskId),
+            subtasks: (() => { try { return JSON.parse(task.subtasksJson || '[]') } catch { return [] } })(),
+            notes: task.description ?? '',
+            comments: (() => { try { return JSON.parse(task.commentsJson || '[]') } catch { return [] } })(),
+            createdAt: new Date(task.createdAt).getTime(),
+          }))
+          dispatch({ type: 'loadTasks', tasks })
+        })
+        .catch((err) => console.error(err))
       // Fetch members for the active project
       fetch(`/api/projects/${state.activeProjectId}/members`)
-        .then((res) => res.json())
+        .then((res) => {
+          if (!res.ok) throw new Error(`Failed to fetch members: ${res.status}`)
+          return res.json()
+        })
         .then((data) => {
-        const users = data.members.map((member: any) => ({
-          id: member.user.id,
-          name: member.user.name,
-          role: member.role,
-        }))
-        dispatch({ type: 'loadUsers', users })
-      })
+          const incoming = (data?.users ?? []).map((u: any) => ({
+            id: u.id,
+            name: u.name,
+            role: u.role,
+          })).filter((u: any) => u.id)
+          if (incoming.length > 0) {
+            dispatch({ type: 'loadUsers', users: incoming })
+          }
+        })
+        .catch((err) => console.error(err))
     }
   }, [state.activeProjectId, state.currentUserId])
 
   const activeProject = state.projects.find((p) => p.id === state.activeProjectId) ?? state.projects[0]
 
-  const canManageProject = currentUser?.role === 'owner' || currentUser?.role === 'lead'
+  // Derive role from the projects list (always available, no async dependency)
+  const activeProjectRole = activeProject?.role
+  const canManageProject =
+    activeProjectRole === 'owner' ||
+    activeProjectRole === 'lead' ||
+    currentUser?.role === 'owner' ||
+    currentUser?.role === 'lead'
   const selectedTask = state.tasks.find((task) => task.id === state.selectedTaskId) ?? null
 
   const levelByTaskId = useMemo(() => computeLevels(state.tasks), [state.tasks])
@@ -576,7 +592,7 @@ export default function XTasksApp({
     : 'min-h-screen bg-gradient-to-br from-fuchsia-50 via-cyan-50 to-violet-100 text-slate-900'
 
   const persistTask = async (taskId: string, patch: Partial<TaskNode>) => {
-    await fetch(`/api/tasks/${taskId}`, {
+    const res = await fetch(`/api/tasks/${taskId}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -590,6 +606,7 @@ export default function XTasksApp({
         dependencyIds: patch.dependencyIds,
       }),
     })
+    if (!res.ok) console.error(`Failed to persist task ${taskId}: ${res.status}`)
   }
 
   const createTaskRemote = async () => {
@@ -612,6 +629,8 @@ export default function XTasksApp({
         patch: {},
       })
       window.location.reload()
+    } else {
+      console.error(`Failed to create task: ${response.status}`)
     }
   }
 
@@ -627,6 +646,8 @@ export default function XTasksApp({
       const data = await response.json()
       dispatch({ type: 'addProject', project: data.project })
       dispatch({ type: 'switchProject', projectId: data.project.id })
+    } else {
+      console.error(`Failed to create project: ${response.status}`)
     }
   }
 
@@ -638,21 +659,21 @@ export default function XTasksApp({
             <h1 className="text-3xl font-black tracking-tight sm:text-4xl">XTASKS</h1>
             <p className="text-sm opacity-80">Shared critical-path project cockpit for high-velocity teams.</p>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-row items-center gap-3">
             <select
               value={state.activeProjectId}
               onChange={(event) => dispatch({ type: 'switchProject', projectId: event.target.value })}
-              className="rounded-xl border bg-transparent px-3 py-2 text-sm font-semibold"
+              className="h-9 rounded-xl border bg-transparent px-3 text-sm font-semibold"
             >
               {state.projects.map((project) => (
                 <option key={project.id} value={project.id}>{project.name}</option>
               ))}
             </select>
-            <button className="rounded-xl border px-3 py-2 text-sm font-semibold transition hover:scale-105" type="button" onClick={createProjectRemote}>
+            <button className="h-9 whitespace-nowrap rounded-xl border px-3 text-sm font-semibold transition hover:scale-105" type="button" onClick={createProjectRemote}>
               New Project
             </button>
             {canManageProject && (
-              <button className="rounded-xl border px-3 py-2 text-sm font-semibold transition hover:scale-105" type="button" onClick={createTaskRemote}>
+              <button className="flex h-9 flex-row items-center gap-1.5 whitespace-nowrap rounded-xl border px-3 text-sm font-semibold transition hover:scale-105" type="button" onClick={createTaskRemote}>
                 <PlusIcon />
                 Create Task
               </button>
@@ -660,16 +681,16 @@ export default function XTasksApp({
             <select
               value={state.currentUserId}
               onChange={(event) => dispatch({ type: 'switchUser', userId: event.target.value })}
-              className="rounded-xl border bg-transparent px-3 py-2 text-sm font-semibold"
+              className="h-9 rounded-xl border bg-transparent px-3 text-sm font-semibold"
             >
               {state.users.map((user) => (
                 <option key={user.id} value={user.id}>{user.name} ({user.role})</option>
               ))}
             </select>
-            <button className="rounded-xl border px-3 py-2 text-sm font-semibold transition hover:scale-105" type="button" onClick={() => dispatch({ type: 'toggleTheme' })}>
+            <button className="h-9 whitespace-nowrap rounded-xl border px-3 text-sm font-semibold transition hover:scale-105" type="button" onClick={() => dispatch({ type: 'toggleTheme' })}>
               {state.darkMode ? 'Light' : 'Dark'} Mode
             </button>
-            <button className="rounded-xl border px-3 py-2 text-sm font-semibold transition hover:scale-105" type="button" onClick={() => signOut({ callbackUrl: '/login' })}>
+            <button className="h-9 whitespace-nowrap rounded-xl border px-3 text-sm font-semibold transition hover:scale-105" type="button" onClick={() => signOut({ callbackUrl: '/login' })}>
               Sign out
             </button>
           </div>
@@ -747,13 +768,13 @@ export default function XTasksApp({
               : 'border-cyan-300 bg-white/90 text-slate-900'
 
             return (
-              <button
+              <div
                 key={task.id}
-                type="button"
-                onClick={() => {
-                  dispatch({ type: 'openTask', taskId: task.id })
-                }}
-                className={`absolute w-[220px] rounded-2xl border-2 p-3 text-left shadow-lg backdrop-blur transition duration-200 hover:-translate-y-1 hover:scale-[1.01] ${nodeStateClass} ${isCritical ? 'ring-2 ring-fuchsia-400' : ''}`}
+                role="button"
+                tabIndex={0}
+                onClick={() => dispatch({ type: 'openTask', taskId: task.id })}
+                onKeyDown={(e) => e.key === 'Enter' && dispatch({ type: 'openTask', taskId: task.id })}
+                className={`absolute w-[220px] cursor-pointer rounded-2xl border-2 p-3 text-left shadow-lg backdrop-blur transition duration-200 hover:-translate-y-1 hover:scale-[1.01] ${nodeStateClass} ${isCritical ? 'ring-2 ring-fuchsia-400' : ''}`}
                 style={{ left: graphNodes[task.id]?.x ?? 100, top: graphNodes[task.id]?.y ?? 100 }}
               >
                 <div className="mb-1 flex items-start justify-between gap-1">
@@ -768,23 +789,42 @@ export default function XTasksApp({
                 <p className="text-xs opacity-80">Owner: {state.users.find((u) => u.id === task.assigneeId)?.name ?? 'Unassigned'}</p>
                 <p className="text-xs opacity-80">Duration: {task.duration}d</p>
                 <p className="text-xs opacity-80">Depends on: {task.dependencyIds.length}</p>
-                <div className="mt-2 flex items-center justify-between">
-                  <span className="rounded-full bg-black/10 px-2 py-0.5 text-[10px] font-bold uppercase">{task.status.replace('_', ' ')}</span>
-                  <label className="flex items-center gap-1 text-xs font-semibold">
-                    <input
-                      type="checkbox"
-                      checked={task.status === 'done'}
-                      disabled={locked || !userCanEditTask}
-                      onChange={(event) => {
-                        event.stopPropagation()
-                        dispatch({ type: 'toggleTaskDone', taskId: task.id })
-                        void persistTask(task.id, { status: task.status === 'done' ? 'in_progress' : 'done' })
-                      }}
-                    />
-                    {locked ? 'Locked' : 'Done'}
-                  </label>
+                <div className="mt-2 flex flex-col gap-1">
+                  <span className="rounded-full bg-black/10 px-2 py-0.5 text-[10px] font-bold uppercase w-fit">{task.status.replace('_', ' ')}</span>
+                  {locked ? (
+                    <span className="text-xs font-semibold opacity-60">🔒 Locked — complete dependencies first</span>
+                  ) : (
+                    <div className="flex items-center gap-3" onClick={(e) => e.stopPropagation()}>
+                      <label className="flex items-center gap-1 text-xs font-semibold cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={task.status === 'in_progress'}
+                          disabled={!userCanEditTask || task.status === 'done'}
+                          onChange={() => {
+                            const next: TaskStatus = task.status === 'in_progress' ? 'todo' : 'in_progress'
+                            dispatch({ type: 'updateTask', taskId: task.id, patch: { status: next } })
+                            void persistTask(task.id, { status: next })
+                          }}
+                        />
+                        In Progress
+                      </label>
+                      <label className="flex items-center gap-1 text-xs font-semibold cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={task.status === 'done'}
+                          disabled={!userCanEditTask}
+                          onChange={() => {
+                            const next: TaskStatus = task.status === 'done' ? 'in_progress' : 'done'
+                            dispatch({ type: 'updateTask', taskId: task.id, patch: { status: next } })
+                            void persistTask(task.id, { status: next })
+                          }}
+                        />
+                        Done
+                      </label>
+                    </div>
+                  )}
                 </div>
-              </button>
+              </div>
             )
           })}
         </div>

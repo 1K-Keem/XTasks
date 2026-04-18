@@ -46,31 +46,37 @@ export async function POST(request: Request, { params }: { params: { projectId: 
   if (!session?.user?.id) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   if (!(await canAccess(params.projectId, session.user.id))) return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
 
-  const payload = taskSchema.parse(await request.json())
-  const created = await prisma.task.create({
-    data: {
-      projectId: params.projectId,
-      title: payload.title,
-      description: payload.description,
-      status: payload.status,
-      durationDays: payload.durationDays,
-      assigneeId: payload.assigneeId ?? undefined,
-      subtasksJson: payload.subtasksJson ?? '[]',
-      commentsJson: payload.commentsJson ?? '[]',
-    },
-  })
+  try {
+    const payload = taskSchema.parse(await request.json())
+    const created = await prisma.task.create({
+      data: {
+        projectId: params.projectId,
+        title: payload.title,
+        description: payload.description,
+        status: payload.status,
+        durationDays: payload.durationDays,
+        assigneeId: payload.assigneeId ?? undefined,
+        subtasksJson: payload.subtasksJson ?? '[]',
+        commentsJson: payload.commentsJson ?? '[]',
+      },
+    })
 
-  if (payload.dependencyIds.length > 0) {
-    const tasks = await prisma.task.findMany({ where: { projectId: params.projectId }, select: { id: true } })
-    const deps = await prisma.dependency.findMany({ where: { task: { projectId: params.projectId } }, select: { taskId: true, dependsOnTaskId: true } })
-    for (const depId of payload.dependencyIds) {
-      if (wouldCreateCycle(tasks, deps, created.id, depId)) {
-        await prisma.task.delete({ where: { id: created.id } })
-        return NextResponse.json({ error: 'Dependency introduces a cycle.' }, { status: 400 })
+    if (payload.dependencyIds.length > 0) {
+      const tasks = await prisma.task.findMany({ where: { projectId: params.projectId }, select: { id: true } })
+      const deps = await prisma.dependency.findMany({ where: { task: { projectId: params.projectId } }, select: { taskId: true, dependsOnTaskId: true } })
+      for (const depId of payload.dependencyIds) {
+        if (wouldCreateCycle(tasks, deps, created.id, depId)) {
+          await prisma.task.delete({ where: { id: created.id } })
+          return NextResponse.json({ error: 'Dependency introduces a cycle.' }, { status: 400 })
+        }
+        await prisma.dependency.create({ data: { taskId: created.id, dependsOnTaskId: depId } })
       }
-      await prisma.dependency.create({ data: { taskId: created.id, dependsOnTaskId: depId } })
     }
-  }
 
-  return NextResponse.json({ task: created })
+    return NextResponse.json({ task: created })
+  } catch (err: any) {
+    if (err?.name === 'ZodError') return NextResponse.json({ error: 'Invalid request.' }, { status: 400 })
+    console.error(err)
+    return NextResponse.json({ error: 'Internal server error.' }, { status: 500 })
+  }
 }
