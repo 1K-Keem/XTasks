@@ -1,0 +1,68 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id             String    @id @default(cuid())
+  name           String?
+  email          String    @unique
+  passwordHash   String
+  profilePicture String?
+  projects       Project[] @relation("ProjectOwner")
+  tasks          Task[]    @relation("TaskAssignee")
+  projectMembers ProjectMember[]
+  createdAt      DateTime  @default(now())
+}
+
+model Project {
+  id        String   @id @default(cuid())
+  name      String
+  ownerId   String
+  owner     User     @relation("ProjectOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  tasks     Task[]
+  members   ProjectMember[]
+  createdAt DateTime @default(now())
+}
+
+model ProjectMember {
+  id        String  @id @default(cuid())
+  userId    String
+  user      User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  role      String  @default("member")
+
+  @@unique([userId, projectId])
+}
+
+model Task {
+  id           String       @id @default(cuid())
+  projectId    String
+  project      Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  title        String
+  status       String       @default("todo")
+  description  String?
+  assigneeId   String?
+  assignee     User?        @relation("TaskAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
+  durationDays Int          @default(1)
+  subtasksJson String       @default("[]")
+  commentsJson String       @default("[]")
+  createdAt    DateTime     @default(now())
+  dependencies Dependency[] @relation("TaskDependencies")
+  dependents   Dependency[] @relation("TaskDependents")
+}
+
+model Dependency {
+  id              String @id @default(cuid())
+  taskId          String
+  dependsOnTaskId String
+  task            Task   @relation("TaskDependencies", fields: [taskId], references: [id], onDelete: Cascade)
+  dependsOnTask   Task   @relation("TaskDependents", fields: [dependsOnTaskId], references: [id], onDelete: Cascade)
+
+  @@unique([taskId, dependsOnTaskId])
+}

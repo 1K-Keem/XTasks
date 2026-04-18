@@ -1,1008 +1,806 @@
 'use client'
 
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { signOut } from 'next-auth/react'
+import { useEffect, useMemo, useReducer, useState } from 'react'
+
+type Role = 'owner' | 'lead' | 'member'
+type TaskStatus = 'todo' | 'in_progress' | 'done' | 'blocked'
+
+type TeamUser = {
+  id: string
+  name: string
+  role: Role
+}
+
+type Subtask = {
+  id: string
+  title: string
+  done: boolean
+}
 
 type TaskNode = {
   id: string
   title: string
-  description: string
-  completed: boolean
-  children: TaskNode[]
+  duration: number
+  assigneeId: string
+  status: TaskStatus
+  dependencyIds: string[]
+  subtasks: Subtask[]
+  notes: string
+  comments: string[]
+  createdAt: number
 }
 
-type TaskLink = {
-  id: string
-  from: string
-  to: string
+type AppState = {
+  projects: { id: string; name: string; role: string }[]
+  activeProjectId: string
+  users: TeamUser[]
+  currentUserId: string
+  tasks: TaskNode[]
+  selectedTaskId: string | null
+  darkMode: boolean
 }
 
-type HoverCardState = {
-  taskId: string
-  x: number
-  y: number
-  editable: boolean
-}
-
-type Point = {
-  x: number
-  y: number
-}
-
+type AppAction =
+  | { type: 'switchUser'; userId: string }
+  | { type: 'switchProject'; projectId: string }
+  | { type: 'addProject'; project: { id: string; name: string; role: string } }
+  | { type: 'loadTasks'; tasks: TaskNode[] }
+  | { type: 'loadUsers'; users: TeamUser[] }
+  | { type: 'toggleTheme' }
+  | { type: 'openTask'; taskId: string | null }
+  | { type: 'createTask' }
+  | { type: 'deleteTask'; taskId: string }
+  | { type: 'updateTask'; taskId: string; patch: Partial<TaskNode> }
+  | { type: 'toggleTaskDone'; taskId: string }
+  | { type: 'addSubtask'; taskId: string; title: string }
+  | { type: 'toggleSubtask'; taskId: string; subtaskId: string }
+  | { type: 'renameSubtask'; taskId: string; subtaskId: string; title: string }
+  | { type: 'deleteSubtask'; taskId: string; subtaskId: string }
+  | { type: 'addComment'; taskId: string; text: string }
 const createId = () => `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 
-const createTask = (title: string): TaskNode => ({
-  id: createId(),
-  title,
-  description: '',
-  completed: false,
-  children: [],
-})
+const isDone = (task: TaskNode) => task.status === 'done'
 
-function AddIcon() {
-  return (
-    <svg viewBox="0 0 16 16" aria-hidden="true" className="xt-icon">
-      <path d="M7 3h2v10H7z" fill="currentColor" />
-      <path d="M3 7h10v2H3z" fill="currentColor" />
-    </svg>
-  )
-}
-
-function CollapseIcon({ collapsed }: { collapsed: boolean }) {
-  return (
-    <svg viewBox="0 0 16 16" aria-hidden="true" className="xt-icon">
-      {collapsed ? <path d="M6 3l5 5-5 5V3z" fill="currentColor" /> : <path d="M3 6l5 5 5-5H3z" fill="currentColor" />}
-    </svg>
-  )
-}
-
-function DeleteIcon() {
-  return (
-    <svg viewBox="0 0 16 16" aria-hidden="true" className="xt-icon">
-      <path d="M4.2 3.1 3.1 4.2 6.9 8l-3.8 3.8 1.1 1.1L8 9.1l3.8 3.8 1.1-1.1L9.1 8l3.8-3.8-1.1-1.1L8 6.9 4.2 3.1z" fill="currentColor" />
-    </svg>
-  )
-}
-
-function toggleTask(nodes: TaskNode[], id: string): TaskNode[] {
-  const setSubtree = (node: TaskNode, completed: boolean): TaskNode => ({
-    ...node,
-    completed,
-    children: node.children.map((child) => setSubtree(child, completed)),
+function taskLocked(task: TaskNode, tasks: TaskNode[]) {
+  if (task.dependencyIds.length === 0) return false
+  return task.dependencyIds.some((depId) => {
+    const dep = tasks.find((t) => t.id === depId)
+    return !dep || !isDone(dep)
   })
+}
 
-  const walk = (list: TaskNode[], depth: number): TaskNode[] => {
-    return list.map((node) => {
-      if (node.id === id) {
-        const nextCompleted = !node.completed
-        return depth === 0 ? setSubtree(node, nextCompleted) : { ...node, completed: nextCompleted }
+function wouldCreateCycle(tasks: TaskNode[], taskId: string, dependsOnTaskId: string): boolean {
+  if (taskId === dependsOnTaskId) return true
+  const edges = new Map<string, string[]>()
+  for (const task of tasks) edges.set(task.id, [...task.dependencyIds])
+  edges.set(taskId, [...(edges.get(taskId) ?? []), dependsOnTaskId])
+  const visiting = new Set<string>()
+  const visited = new Set<string>()
+  const dfs = (id: string): boolean => {
+    if (visiting.has(id)) return true
+    if (visited.has(id)) return false
+    visiting.add(id)
+    const next = edges.get(id) ?? []
+    for (const n of next) {
+      if (dfs(n)) return true
+    }
+    visiting.delete(id)
+    visited.add(id)
+    return false
+  }
+  return tasks.some((task) => dfs(task.id))
+}
+
+function longestPath(tasks: TaskNode[]) {
+  const memo: Record<string, number> = {}
+  const parent: Record<string, string | null> = {}
+  const stack = new Set<string>()
+
+  const byId = new Map(tasks.map((t) => [t.id, t]))
+  const score = (id: string): number => {
+    if (memo[id] !== undefined) return memo[id]
+    if (stack.has(id)) return 0
+    const task = byId.get(id)
+    if (!task) return 0
+    stack.add(id)
+    if (task.dependencyIds.length === 0) {
+      parent[id] = null
+      memo[id] = task.duration
+      stack.delete(id)
+      return memo[id]
+    }
+    let bestParent: string | null = null
+    let best = 0
+    for (const depId of task.dependencyIds) {
+      const depScore = score(depId)
+      if (depScore > best) {
+        best = depScore
+        bestParent = depId
       }
-
-      if (node.children.length === 0) {
-        return node
-      }
-
-      return { ...node, children: walk(node.children, depth + 1) }
-    })
+    }
+    parent[id] = bestParent
+    memo[id] = best + task.duration
+    stack.delete(id)
+    return memo[id]
   }
 
-  return walk(nodes, 0)
-}
-
-function removeTask(nodes: TaskNode[], id: string): TaskNode[] {
-  return nodes
-    .filter((node) => node.id !== id)
-    .map((node) => ({ ...node, children: removeTask(node.children, id) }))
-}
-
-function addRootTaskNode(nodes: TaskNode[], task: TaskNode): TaskNode[] {
-  return [...nodes, task]
-}
-
-function addChildTaskNode(nodes: TaskNode[], parentId: string, task: TaskNode): TaskNode[] {
-  return nodes.map((node) => {
-    if (node.id === parentId) {
-      return { ...node, children: [...node.children, task] }
-    }
-
-    if (node.children.length === 0) {
-      return node
-    }
-
-    return { ...node, children: addChildTaskNode(node.children, parentId, task) }
-  })
-}
-
-function renameTask(nodes: TaskNode[], id: string, title: string): TaskNode[] {
-  return nodes.map((node) => {
-    if (node.id === id) {
-      return { ...node, title }
-    }
-
-    if (node.children.length === 0) {
-      return node
-    }
-
-    return { ...node, children: renameTask(node.children, id, title) }
-  })
-}
-
-function setTaskDescription(nodes: TaskNode[], id: string, description: string): TaskNode[] {
-  return nodes.map((node) => {
-    if (node.id === id) {
-      return { ...node, description }
-    }
-
-    if (node.children.length === 0) {
-      return node
-    }
-
-    return { ...node, children: setTaskDescription(node.children, id, description) }
-  })
-}
-
-function findTaskById(nodes: TaskNode[], id: string): TaskNode | null {
-  for (const node of nodes) {
-    if (node.id === id) {
-      return node
-    }
-
-    const child = findTaskById(node.children, id)
-    if (child) {
-      return child
+  let endTaskId: string | null = null
+  let max = 0
+  for (const task of tasks) {
+    const value = score(task.id)
+    if (value > max) {
+      max = value
+      endTaskId = task.id
     }
   }
 
-  return null
+  const chain: string[] = []
+  let ptr = endTaskId
+  while (ptr) {
+    chain.unshift(ptr)
+    ptr = parent[ptr] ?? null
+  }
+  return { totalDuration: max, chain }
 }
 
-function TaskTreeList({
-  tasks,
-  onToggle,
-  onDelete,
-  onAddRoot,
-  onAddChild,
-  onSetDescription,
-  onHoverTaskStart,
-  onHoverTaskEnd,
+function computeLevels(tasks: TaskNode[]) {
+  const memo: Record<string, number> = {}
+  const getLevel = (task: TaskNode, visiting = new Set<string>()): number => {
+    if (memo[task.id] !== undefined) return memo[task.id]
+    if (visiting.has(task.id)) {
+      memo[task.id] = 0
+      return 0
+    }
+    visiting.add(task.id)
+    if (task.dependencyIds.length === 0) {
+      memo[task.id] = 0
+      visiting.delete(task.id)
+      return 0
+    }
+    const maxDep = Math.max(
+      ...task.dependencyIds.map((depId) => {
+        const dep = tasks.find((t) => t.id === depId)
+        return dep ? getLevel(dep, visiting) : 0
+      }),
+    )
+    memo[task.id] = maxDep + 1
+    visiting.delete(task.id)
+    return memo[task.id]
+  }
+  tasks.forEach((task) => getLevel(task))
+  return memo
+}
+
+function appReducer(state: AppState, action: AppAction): AppState {
+  switch (action.type) {
+    case 'switchUser':
+      return { ...state, currentUserId: action.userId }
+    case 'switchProject':
+      return { ...state, activeProjectId: action.projectId, tasks: [], selectedTaskId: null }
+    case 'addProject':
+      return { ...state, projects: [...state.projects, action.project] }
+    case 'loadTasks':
+      return { ...state, tasks: action.tasks }
+    case 'loadUsers':
+      return { ...state, users: action.users }
+    case 'toggleTheme':
+      return { ...state, darkMode: !state.darkMode }
+    case 'openTask':
+      return { ...state, selectedTaskId: action.taskId }
+    case 'createTask': {
+      const newTask: TaskNode = {
+        id: `temp-${createId()}`,
+        title: 'New CPM Node',
+        duration: 1,
+        assigneeId: state.currentUserId,
+        status: 'todo',
+        dependencyIds: [],
+        subtasks: [],
+        notes: '',
+        comments: [],
+        createdAt: Date.now(),
+      }
+      return { ...state, tasks: [...state.tasks, newTask], selectedTaskId: newTask.id }
+    }
+    case 'deleteTask': {
+      const tasks = state.tasks
+        .filter((task) => task.id !== action.taskId)
+        .map((task) => ({ ...task, dependencyIds: task.dependencyIds.filter((depId) => depId !== action.taskId) }))
+      const selectedTaskId = state.selectedTaskId === action.taskId ? null : state.selectedTaskId
+      return { ...state, tasks, selectedTaskId }
+    }
+    case 'updateTask':
+      return {
+        ...state,
+        tasks: state.tasks.map((task) => (task.id === action.taskId ? { ...task, ...action.patch } : task)),
+      }
+    case 'toggleTaskDone':
+      return {
+        ...state,
+        tasks: state.tasks.map((task) => {
+          if (task.id !== action.taskId) return task
+          return { ...task, status: task.status === 'done' ? 'in_progress' : 'done' }
+        }),
+      }
+    case 'addSubtask':
+      return {
+        ...state,
+        tasks: state.tasks.map((task) =>
+          task.id === action.taskId ? { ...task, subtasks: [...task.subtasks, { id: createId(), title: action.title, done: false }] } : task,
+        ),
+      }
+    case 'toggleSubtask':
+      return {
+        ...state,
+        tasks: state.tasks.map((task) =>
+          task.id === action.taskId
+            ? {
+                ...task,
+                subtasks: task.subtasks.map((subtask) => (subtask.id === action.subtaskId ? { ...subtask, done: !subtask.done } : subtask)),
+              }
+            : task,
+        ),
+      }
+    case 'renameSubtask':
+      return {
+        ...state,
+        tasks: state.tasks.map((task) =>
+          task.id === action.taskId
+            ? {
+                ...task,
+                subtasks: task.subtasks.map((subtask) => (subtask.id === action.subtaskId ? { ...subtask, title: action.title } : subtask)),
+              }
+            : task,
+        ),
+      }
+    case 'deleteSubtask':
+      return {
+        ...state,
+        tasks: state.tasks.map((task) =>
+          task.id === action.taskId ? { ...task, subtasks: task.subtasks.filter((subtask) => subtask.id !== action.subtaskId) } : task,
+        ),
+      }
+    case 'addComment':
+      return {
+        ...state,
+        tasks: state.tasks.map((task) => (task.id === action.taskId ? { ...task, comments: [...task.comments, action.text] } : task)),
+      }
+    default:
+      return state
+  }
+}
+
+function PlusIcon() {
+  return (
+    <svg viewBox="0 0 24 24" className="h-4 w-4" aria-hidden="true">
+      <path d="M11 4h2v16h-2zM4 11h16v2H4z" fill="currentColor" />
+    </svg>
+  )
+}
+
+function FlagIcon() {
+  return (
+    <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" aria-hidden="true">
+      <path d="M7 3v18h2v-6h7l-1.5-4L16 7H9V3z" fill="currentColor" />
+    </svg>
+  )
+}
+
+function TaskModal({
+  state,
+  task,
+  canEdit,
+  onClose,
+  dispatch,
+  onPatchTask,
 }: {
-  tasks: TaskNode[]
-  onToggle: (id: string) => void
-  onDelete: (id: string) => void
-  onAddRoot: () => void
-  onAddChild: (parentId: string) => void
-  onSetDescription: (id: string, description: string) => void
-  onHoverTaskStart: (task: TaskNode, element: HTMLElement) => void
-  onHoverTaskEnd: () => void
+  state: AppState
+  task: TaskNode
+  canEdit: boolean
+  onClose: () => void
+  dispatch: React.Dispatch<AppAction>
+  onPatchTask: (taskId: string, patch: Partial<TaskNode>) => void
 }) {
-  const [collapsedRoots, setCollapsedRoots] = useState<Record<string, boolean>>({})
-  const [collapsedDescriptions, setCollapsedDescriptions] = useState<Record<string, boolean>>({})
-
-  const toggleCollapse = (id: string) => {
-    setCollapsedRoots((prev) => ({ ...prev, [id]: !prev[id] }))
-  }
-
-  const openCollapse = (id: string) => {
-    setCollapsedRoots((prev) => ({ ...prev, [id]: false }))
-  }
-
-  const toggleDescription = (id: string) => {
-    setCollapsedDescriptions((prev) => ({ ...prev, [id]: !prev[id] }))
-  }
-
-  const renderNodes = (nodes: TaskNode[], level = 0): React.ReactNode => {
-    return nodes.map((node) => (
-      <li key={node.id} className="xt-row xt-sub-row" style={{ marginLeft: `${level * 12}px` }}>
-        <div className="xt-row-main">
-          <input type="checkbox" checked={node.completed} onChange={() => onToggle(node.id)} className="xt-check" spellCheck={false} />
-          <button
-            type="button"
-            className={node.completed ? 'xt-task-done xt-title-btn' : 'xt-task-title xt-title-btn'}
-            onClick={() => toggleCollapse(node.id)}
-            onMouseEnter={(event) => onHoverTaskStart(node, event.currentTarget)}
-            onMouseLeave={onHoverTaskEnd}
-          >
-            {node.title}
-          </button>
-        </div>
-        <div className="xt-row-actions">
-          <button
-            onClick={() => {
-              openCollapse(node.id)
-              onAddChild(node.id)
-            }}
-            className="xt-mini-btn"
-            type="button"
-            title="Add subtask"
-          >
-            <AddIcon />
-          </button>
-          <button onClick={() => onDelete(node.id)} className="xt-mini-btn xt-danger xt-delete-btn" type="button" title="Delete">
-            <DeleteIcon />
-          </button>
-          {node.children.length > 0 && (
-            <button onClick={() => toggleCollapse(node.id)} className="xt-mini-btn" type="button" title="Collapse subtasks">
-              <CollapseIcon collapsed={Boolean(collapsedRoots[node.id])} />
-            </button>
-          )}
-          <button onClick={() => toggleDescription(node.id)} className="xt-mini-btn" type="button" title="Toggle description">
-            Desc
-          </button>
-        </div>
-        {!collapsedDescriptions[node.id] && (
-          <textarea
-            value={node.description}
-            onChange={(event) => onSetDescription(node.id, event.target.value)}
-            placeholder="Task description..."
-            className="xt-desc-input"
-            spellCheck={false}
-          />
-        )}
-        {!collapsedRoots[node.id] && node.children.length > 0 && <ul className="xt-tree">{renderNodes(node.children, level + 1)}</ul>}
-      </li>
-    ))
-  }
+  const [subtaskDraft, setSubtaskDraft] = useState('')
+  const [commentDraft, setCommentDraft] = useState('')
+  const [dependencySearch, setDependencySearch] = useState('')
+  const currentUser = state.users.find((u) => u.id === state.currentUserId)
 
   return (
-    <div className="xt-root-board">
-      {tasks.map((root) => {
-        const isCollapsed = Boolean(collapsedRoots[root.id])
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 backdrop-blur-sm">
+      <div className={`w-full max-w-3xl rounded-3xl border p-5 shadow-2xl ${state.darkMode ? 'border-violet-700 bg-slate-900 text-slate-100' : 'border-slate-200 bg-white text-slate-900'}`}>
+        <div className="mb-4 flex items-center justify-between">
+          <h2 className="text-xl font-black tracking-tight">Task Detail: {task.title}</h2>
+          <button className="rounded-xl border px-3 py-1 text-sm transition hover:scale-105" onClick={onClose} type="button">Close</button>
+        </div>
 
-        return (
-          <article key={root.id} className={`xt-root-card ${root.completed ? 'xt-root-card-done' : ''}`}>
-            <div className="xt-root-header">
-              <div className="xt-row-main">
-                <input type="checkbox" checked={root.completed} onChange={() => onToggle(root.id)} className="xt-check" spellCheck={false} />
-                <button type="button" className={root.completed ? 'xt-task-done xt-title-btn' : 'xt-task-title xt-title-btn'} onClick={() => toggleCollapse(root.id)}>
-                  {root.title}
-                </button>
-              </div>
-              <div className="xt-row-actions">
-                <button
-                  onClick={() => {
-                    openCollapse(root.id)
-                    onAddChild(root.id)
-                  }}
-                  className="xt-mini-btn"
-                  type="button"
-                  title="Add subtask"
-                >
-                  <AddIcon />
-                </button>
-                <button onClick={() => onDelete(root.id)} className="xt-mini-btn xt-danger xt-delete-btn" type="button" title="Delete">
-                  <DeleteIcon />
-                </button>
-                <button onClick={() => toggleCollapse(root.id)} className="xt-mini-btn" type="button" title="Collapse subtasks">
-                  <CollapseIcon collapsed={isCollapsed} />
-                </button>
-                <button onClick={() => toggleDescription(root.id)} className="xt-mini-btn" type="button" title="Toggle description">
-                  Desc
-                </button>
-              </div>
+        <div className="grid gap-4 md:grid-cols-2">
+          <label className="space-y-1 text-sm">
+            <span className="font-semibold">Title</span>
+            <input
+              className="w-full rounded-xl border bg-transparent px-3 py-2"
+              value={task.title}
+              disabled={!canEdit}
+              onChange={(event) => dispatch({ type: 'updateTask', taskId: task.id, patch: { title: event.target.value } })}
+              onBlur={() => onPatchTask(task.id, { title: task.title })}
+            />
+          </label>
+          <label className="space-y-1 text-sm">
+            <span className="font-semibold">Duration (days)</span>
+            <input
+              className="w-full rounded-xl border bg-transparent px-3 py-2"
+              type="number"
+              min={1}
+              value={task.duration}
+              disabled={!canEdit}
+              onChange={(event) => dispatch({ type: 'updateTask', taskId: task.id, patch: { duration: Math.max(1, Number(event.target.value) || 1) } })}
+              onBlur={() => onPatchTask(task.id, { duration: task.duration })}
+            />
+          </label>
+          <label className="space-y-1 text-sm">
+            <span className="font-semibold">Assignee</span>
+            <select
+              className="w-full rounded-xl border bg-transparent px-3 py-2"
+              value={task.assigneeId}
+              disabled={!canEdit}
+              onChange={(event) => dispatch({ type: 'updateTask', taskId: task.id, patch: { assigneeId: event.target.value } })}
+              onBlur={() => onPatchTask(task.id, { assigneeId: task.assigneeId })}
+            >
+              {state.users.map((user) => (
+                <option key={user.id} value={user.id}>{user.name}</option>
+              ))}
+            </select>
+          </label>
+          <label className="space-y-1 text-sm">
+            <span className="font-semibold">Status</span>
+            <select
+              className="w-full rounded-xl border bg-transparent px-3 py-2"
+              value={task.status}
+              disabled={!canEdit}
+              onChange={(event) => dispatch({ type: 'updateTask', taskId: task.id, patch: { status: event.target.value as TaskStatus } })}
+              onBlur={() => onPatchTask(task.id, { status: task.status })}
+            >
+              <option value="todo">To Do</option>
+              <option value="in_progress">In Progress</option>
+              <option value="done">Done</option>
+              <option value="blocked">Blocked</option>
+            </select>
+          </label>
+        </div>
+
+        <div className="mt-4 grid gap-4 md:grid-cols-2">
+          <div className="rounded-2xl border p-3">
+            <h3 className="mb-2 font-bold">Subtasks Checklist</h3>
+            <div className="space-y-2">
+              {task.subtasks.map((subtask) => (
+                <div key={subtask.id} className="flex items-center gap-2">
+                  <input type="checkbox" checked={subtask.done} disabled={!canEdit} onChange={() => dispatch({ type: 'toggleSubtask', taskId: task.id, subtaskId: subtask.id })} />
+                  <input
+                    className="flex-1 rounded-lg border bg-transparent px-2 py-1 text-sm"
+                    value={subtask.title}
+                    disabled={!canEdit}
+                    onChange={(event) => dispatch({ type: 'renameSubtask', taskId: task.id, subtaskId: subtask.id, title: event.target.value })}
+                  />
+                  {canEdit && (
+                    <button className="text-xs text-red-500" type="button" onClick={() => dispatch({ type: 'deleteSubtask', taskId: task.id, subtaskId: subtask.id })}>Delete</button>
+                  )}
+                </div>
+              ))}
             </div>
-
-            {!collapsedDescriptions[root.id] && (
-              <textarea
-                value={root.description}
-                onChange={(event) => onSetDescription(root.id, event.target.value)}
-                placeholder="Task description..."
-                className="xt-desc-input"
-                spellCheck={false}
-              />
-            )}
-
-            {!isCollapsed && (
-              <div className="xt-root-body">
-                {root.children.length > 0 ? <ul className="xt-tree xt-root-children">{renderNodes(root.children, 1)}</ul> : <p className="xt-empty-note">No subtasks yet.</p>}
+            {canEdit && (
+              <div className="mt-2 flex gap-2">
+                <input className="flex-1 rounded-lg border bg-transparent px-2 py-1 text-sm" value={subtaskDraft} onChange={(event) => setSubtaskDraft(event.target.value)} placeholder="Add subtask..." />
+                <button
+                  type="button"
+                  className="rounded-lg bg-cyan-600 px-3 py-1 text-sm font-semibold text-white"
+                  onClick={() => {
+                    const title = subtaskDraft.trim()
+                    if (!title) return
+                    dispatch({ type: 'addSubtask', taskId: task.id, title })
+                    setSubtaskDraft('')
+                  }}
+                >
+                  Add
+                </button>
               </div>
             )}
-          </article>
-        )
-      })}
+          </div>
 
-      <button className="xt-root-add" type="button" onClick={onAddRoot} title="Add new task">
-        <AddIcon />
-      </button>
+          <div className="rounded-2xl border p-3">
+            <h3 className="mb-2 font-bold">Notes & Comments</h3>
+            <textarea
+              className="h-24 w-full rounded-xl border bg-transparent p-2 text-sm"
+              value={task.notes}
+              disabled={!canEdit}
+              placeholder="Capture decisions, context, and team notes..."
+              onChange={(event) => dispatch({ type: 'updateTask', taskId: task.id, patch: { notes: event.target.value } })}
+              onBlur={() => onPatchTask(task.id, { notes: task.notes })}
+            />
+            <div className="mt-2 space-y-1 text-sm">
+              {task.comments.map((comment, idx) => (
+                <p key={`${comment}-${idx}`} className="rounded-lg bg-black/5 px-2 py-1">{comment}</p>
+              ))}
+            </div>
+            <div className="mt-2 flex gap-2">
+              <input className="flex-1 rounded-lg border bg-transparent px-2 py-1 text-sm" value={commentDraft} onChange={(event) => setCommentDraft(event.target.value)} placeholder="Add team comment..." />
+              <button
+                className="rounded-lg border px-3 py-1 text-sm"
+                type="button"
+                onClick={() => {
+                  const text = commentDraft.trim()
+                  if (!text) return
+                  dispatch({ type: 'addComment', taskId: task.id, text: `${currentUser?.name ?? 'User'}: ${text}` })
+                  setCommentDraft('')
+                }}
+              >
+                Send
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div className="mt-4 rounded-2xl border p-3">
+          <h3 className="mb-2 font-bold">Dependencies (Lead editable)</h3>
+          <input
+            className="mb-2 w-full rounded-lg border bg-transparent px-2 py-1 text-sm"
+            placeholder="Search dependency nodes..."
+            value={dependencySearch}
+            onChange={(event) => setDependencySearch(event.target.value)}
+          />
+          <div className="grid gap-1 sm:grid-cols-2">
+            {state.tasks
+              .filter((candidate) => candidate.id !== task.id && candidate.title.toLowerCase().includes(dependencySearch.toLowerCase()))
+              .map((candidate) => (
+              <label key={candidate.id} className="flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  disabled={!canEdit}
+                  checked={task.dependencyIds.includes(candidate.id)}
+                  onChange={(event) => {
+                    const set = new Set(task.dependencyIds)
+                    if (event.target.checked) {
+                      if (wouldCreateCycle(state.tasks, task.id, candidate.id)) return
+                      set.add(candidate.id)
+                    } else {
+                      set.delete(candidate.id)
+                    }
+                    const dependencyIds = Array.from(set)
+                    dispatch({ type: 'updateTask', taskId: task.id, patch: { dependencyIds } })
+                    onPatchTask(task.id, { dependencyIds })
+                  }}
+                />
+                {candidate.title}
+              </label>
+            ))}
+          </div>
+        </div>
+      </div>
     </div>
   )
 }
 
-const seedTasks: TaskNode[] = []
-
-export default function XTasksApp() {
-  const graphRef = useRef<HTMLDivElement | null>(null)
-  const hoverHideTimer = useRef<number | null>(null)
-  const [tasks, setTasks] = useState<TaskNode[]>(seedTasks)
-  const [activeTab, setActiveTab] = useState<'list' | 'visualize'>('list')
-  const [editingId, setEditingId] = useState<string | null>(null)
-  const [editingTitle, setEditingTitle] = useState('')
-  const [visualWindowRootId, setVisualWindowRootId] = useState<string | null>(null)
-  const [visualCollapsed, setVisualCollapsed] = useState<Record<string, boolean>>({})
-  const [taskLinks, setTaskLinks] = useState<TaskLink[]>([])
-  const [hoverCard, setHoverCard] = useState<HoverCardState | null>(null)
-  const [hoverCardEditMode, setHoverCardEditMode] = useState(false)
-  const [tabMenu, setTabMenu] = useState<{ open: boolean; x: number; y: number; graphX: number; graphY: number }>({
-    open: false,
-    x: 0,
-    y: 0,
-    graphX: 30,
-    graphY: 30,
+export default function XTasksApp({
+  initialProjects,
+  initialActiveProjectId,
+  initialUsers,
+  initialCurrentUserId,
+  initialTasks,
+}: {
+  initialProjects: { id: string; name: string; role: string }[]
+  initialActiveProjectId: string
+  initialUsers: TeamUser[]
+  initialCurrentUserId: string
+  initialTasks: TaskNode[]
+}): JSX.Element {
+  const [state, dispatch] = useReducer(appReducer, {
+    projects: initialProjects,
+    activeProjectId: initialActiveProjectId,
+    users: initialUsers,
+    currentUserId: initialCurrentUserId,
+    tasks: initialTasks,
+    selectedTaskId: null,
+    darkMode: false,
   })
-  const [linkDragging, setLinkDragging] = useState<{ fromId: string; x: number; y: number } | null>(null)
-  const [dragging, setDragging] = useState<{ id: string; offsetX: number; offsetY: number } | null>(null)
-
-  const rowHeight = 130
-  const colWidth = 260
-  const graphHeight = Math.max(760, tasks.length * rowHeight + 160)
-
-  const defaultPoints = useMemo<Record<string, Point>>(() => {
-    const map: Record<string, Point> = {}
-    tasks.forEach((node, index) => {
-      map[node.id] = {
-        x: 70 + (index % 4) * colWidth,
-        y: 40 + Math.floor(index / 4) * rowHeight,
-      }
-    })
-    return map
-  }, [tasks])
-
-  const rootTasks = useMemo(() => tasks.map((task) => ({ id: task.id, title: task.title })), [tasks])
-
-  const [nodePositions, setNodePositions] = useState<Record<string, Point>>({})
-
+  const currentUser = state.users.find((u) => u.id === state.currentUserId)
   useEffect(() => {
-    setNodePositions((prev) => {
-      const next: Record<string, Point> = {}
-      tasks.forEach((node) => {
-        next[node.id] = prev[node.id] ?? defaultPoints[node.id]
+    if (state.activeProjectId) {
+      // Fetch tasks for the active project
+      fetch(`/api/projects/${state.activeProjectId}/tasks`)
+        .then((res) => res.json())
+        .then((data) => {
+        const tasks = data.tasks.map((task: any) => ({
+          id: task.id,
+          title: task.title,
+          duration: task.durationDays,
+          assigneeId: task.assigneeId ?? state.currentUserId,
+          status: task.status as TaskStatus,
+          dependencyIds: task.dependencies.map((dep: any) => dep.dependsOnTaskId),
+          subtasks: JSON.parse(task.subtasksJson || '[]'),
+          notes: task.description ?? '',
+          comments: JSON.parse(task.commentsJson || '[]'),
+          createdAt: new Date(task.createdAt).getTime(),
+        }))
+        dispatch({ type: 'loadTasks', tasks })
       })
-      return next
-    })
-  }, [defaultPoints, tasks])
-
-  useEffect(() => {
-    const taskIdSet = new Set(tasks.map((task) => task.id))
-    setTaskLinks((prev) => prev.filter((link) => taskIdSet.has(link.from) && taskIdSet.has(link.to)))
-    setVisualWindowRootId((prev) => (prev && taskIdSet.has(prev) ? prev : null))
-    setVisualCollapsed((prev) => {
-      const next: Record<string, boolean> = {}
-      Object.entries(prev).forEach(([id, value]) => {
-        if (taskIdSet.has(id)) {
-          next[id] = value
-        }
+      // Fetch members for the active project
+      fetch(`/api/projects/${state.activeProjectId}/members`)
+        .then((res) => res.json())
+        .then((data) => {
+        const users = data.members.map((member: any) => ({
+          id: member.user.id,
+          name: member.user.name,
+          role: member.role,
+        }))
+        dispatch({ type: 'loadUsers', users })
       })
-      return next
+    }
+  }, [state.activeProjectId, state.currentUserId])
+
+  const activeProject = state.projects.find((p) => p.id === state.activeProjectId) ?? state.projects[0]
+
+  const canManageProject = currentUser?.role === 'owner' || currentUser?.role === 'lead'
+  const selectedTask = state.tasks.find((task) => task.id === state.selectedTaskId) ?? null
+
+  const levelByTaskId = useMemo(() => computeLevels(state.tasks), [state.tasks])
+  const criticalPath = useMemo(() => longestPath(state.tasks), [state.tasks])
+
+  const tasksByLevel = useMemo(() => {
+    const grouped: Record<number, TaskNode[]> = {}
+    for (const task of state.tasks) {
+      const level = levelByTaskId[task.id] ?? 0
+      grouped[level] = [...(grouped[level] ?? []), task]
+    }
+    return grouped
+  }, [levelByTaskId, state.tasks])
+
+  const graphNodes = useMemo(() => {
+    const levelGapX = 290
+    const rowGapY = 170
+    const layout: Record<string, { x: number; y: number }> = {}
+    Object.entries(tasksByLevel).forEach(([rawLevel, levelTasks]) => {
+      const level = Number(rawLevel)
+      levelTasks.forEach((task, idx) => {
+        layout[task.id] = { x: 80 + level * levelGapX, y: 100 + idx * rowGapY }
+      })
     })
-  }, [tasks])
+    return layout
+  }, [tasksByLevel])
 
-  useEffect(() => {
-    return () => {
-      if (hoverHideTimer.current) {
-        window.clearTimeout(hoverHideTimer.current)
-      }
-    }
-  }, [])
+  const totalDuration = state.tasks.reduce((sum, task) => sum + task.duration, 0)
+  const completedDuration = state.tasks.filter((task) => task.status === 'done').reduce((sum, task) => sum + task.duration, 0)
+  const completionRate = totalDuration === 0 ? 0 : Math.round((completedDuration / totalDuration) * 100)
 
-  useEffect(() => {
-    if (!dragging) {
-      return
-    }
+  const baseClass = state.darkMode
+    ? 'min-h-screen bg-slate-950 text-slate-100'
+    : 'min-h-screen bg-gradient-to-br from-fuchsia-50 via-cyan-50 to-violet-100 text-slate-900'
 
-    const onPointerMove = (event: PointerEvent) => {
-      const graph = graphRef.current
-      if (!graph) {
-        return
-      }
-
-      const rect = graph.getBoundingClientRect()
-      const maxX = Math.max(8, graph.clientWidth - 180)
-      const maxY = Math.max(8, graph.clientHeight - 90)
-
-      const x = Math.min(maxX, Math.max(8, event.clientX - rect.left - dragging.offsetX))
-      const y = Math.min(maxY, Math.max(8, event.clientY - rect.top - dragging.offsetY))
-
-      setNodePositions((prev) => ({
-        ...prev,
-        [dragging.id]: { x, y },
-      }))
-    }
-
-    const onPointerUp = () => {
-      setDragging(null)
-    }
-
-    window.addEventListener('pointermove', onPointerMove)
-    window.addEventListener('pointerup', onPointerUp)
-    return () => {
-      window.removeEventListener('pointermove', onPointerMove)
-      window.removeEventListener('pointerup', onPointerUp)
-    }
-  }, [dragging])
-
-  useEffect(() => {
-    if (!linkDragging) {
-      return
-    }
-
-    const onPointerMove = (event: PointerEvent) => {
-      const graph = graphRef.current
-      if (!graph) {
-        return
-      }
-
-      const rect = graph.getBoundingClientRect()
-      setLinkDragging((prev) => (prev ? { ...prev, x: event.clientX - rect.left, y: event.clientY - rect.top } : null))
-    }
-
-    const onPointerUp = () => {
-      setLinkDragging(null)
-    }
-
-    window.addEventListener('pointermove', onPointerMove)
-    window.addEventListener('pointerup', onPointerUp)
-    return () => {
-      window.removeEventListener('pointermove', onPointerMove)
-      window.removeEventListener('pointerup', onPointerUp)
-    }
-  }, [linkDragging])
-
-  useEffect(() => {
-    if (!tabMenu.open) {
-      return
-    }
-
-    const closeMenu = () => {
-      setTabMenu({ open: false, x: 0, y: 0, graphX: 30, graphY: 30 })
-    }
-
-    window.addEventListener('click', closeMenu)
-    return () => {
-      window.removeEventListener('click', closeMenu)
-    }
-  }, [tabMenu.open])
-
-  const showHoverCard = (task: TaskNode, element: HTMLElement, editable = false) => {
-    if (hoverHideTimer.current) {
-      window.clearTimeout(hoverHideTimer.current)
-      hoverHideTimer.current = null
-    }
-
-    const rect = element.getBoundingClientRect()
-    const width = 300
-    const x = Math.min(window.innerWidth - width - 12, rect.right + 14)
-
-    setHoverCard({
-      taskId: task.id,
-      x: Math.max(12, x),
-      y: Math.max(12, rect.top - 8),
-      editable,
-    })
-    setHoverCardEditMode(false)
-  }
-
-  const hideHoverCard = () => {
-    if (hoverHideTimer.current) {
-      window.clearTimeout(hoverHideTimer.current)
-    }
-
-    hoverHideTimer.current = window.setTimeout(() => {
-      setHoverCard(null)
-      setHoverCardEditMode(false)
-      hoverHideTimer.current = null
-    }, 120)
-  }
-
-  const keepHoverCardOpen = () => {
-    if (hoverHideTimer.current) {
-      window.clearTimeout(hoverHideTimer.current)
-      hoverHideTimer.current = null
-    }
-  }
-
-  const addRootNew = () => {
-    const task = createTask('New')
-    setTasks((prev) => addRootTaskNode(prev, task))
-  }
-
-  const addChildNew = (parentId: string) => {
-    const task = createTask('New')
-    setTasks((prev) => addChildTaskNode(prev, parentId, task))
-    setVisualCollapsed((prev) => ({ ...prev, [parentId]: false }))
-    setVisualWindowRootId(parentId)
-  }
-
-  const setDescription = (id: string, description: string) => {
-    setTasks((prev) => setTaskDescription(prev, id, description))
-  }
-
-  const toggle = (id: string) => {
-    setTasks((prev) => toggleTask(prev, id))
-  }
-
-  const remove = (id: string) => {
-    setTasks((prev) => removeTask(prev, id))
-  }
-
-  const startRename = (id: string, title: string) => {
-    setEditingId(id)
-    setEditingTitle(title)
-  }
-
-  const submitRename = () => {
-    const id = editingId
-    const title = editingTitle.trim()
-
-    if (!id) {
-      return
-    }
-
-    if (!title) {
-      setEditingId(null)
-      setEditingTitle('')
-      setHoverCard(null)
-      setHoverCardEditMode(false)
-      return
-    }
-
-    setTasks((prev) => renameTask(prev, id, title))
-    setEditingId(null)
-    setEditingTitle('')
-    setHoverCard(null)
-    setHoverCardEditMode(false)
-  }
-
-  const cancelRename = () => {
-    setEditingId(null)
-    setEditingTitle('')
-    setHoverCard(null)
-    setHoverCardEditMode(false)
-  }
-
-  const addLinkByDrag = (fromId: string, toId: string) => {
-    if (!fromId || !toId || fromId === toId) {
-      return
-    }
-
-    const exists = taskLinks.some((link) => link.from === fromId && link.to === toId)
-    if (exists) {
-      return
-    }
-
-    setTaskLinks((prev) => [...prev, { id: createId(), from: fromId, to: toId }])
-  }
-
-  const removeLink = (id: string) => {
-    setTaskLinks((prev) => prev.filter((link) => link.id !== id))
-  }
-
-  const toggleVisualCollapse = (id: string) => {
-    setVisualCollapsed((prev) => ({ ...prev, [id]: !prev[id] }))
-  }
-
-  const openVisualCollapse = (id: string) => {
-    setVisualCollapsed((prev) => ({ ...prev, [id]: false }))
-  }
-
-  const beginDrag = (event: React.PointerEvent<HTMLDivElement>, id: string) => {
-    const target = event.target as HTMLElement
-    if (target.closest('button,input,textarea')) {
-      return
-    }
-
-    const graph = graphRef.current
-    if (!graph) {
-      return
-    }
-
-    const rect = graph.getBoundingClientRect()
-    const point = nodePositions[id] ?? defaultPoints[id]
-    if (!point) {
-      return
-    }
-
-    setDragging({
-      id,
-      offsetX: event.clientX - rect.left - point.x,
-      offsetY: event.clientY - rect.top - point.y,
+  const persistTask = async (taskId: string, patch: Partial<TaskNode>) => {
+    await fetch(`/api/tasks/${taskId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        title: patch.title,
+        description: patch.notes,
+        status: patch.status,
+        durationDays: patch.duration,
+        assigneeId: patch.assigneeId,
+        subtasksJson: patch.subtasks ? JSON.stringify(patch.subtasks) : undefined,
+        commentsJson: patch.comments ? JSON.stringify(patch.comments) : undefined,
+        dependencyIds: patch.dependencyIds,
+      }),
     })
   }
 
-  const beginLinkDrag = (event: React.PointerEvent<HTMLButtonElement>, fromId: string) => {
-    event.preventDefault()
-    event.stopPropagation()
-
-    const graph = graphRef.current
-    if (!graph) {
-      return
-    }
-
-    const rect = graph.getBoundingClientRect()
-    setLinkDragging({ fromId, x: event.clientX - rect.left, y: event.clientY - rect.top })
-  }
-
-  const onRootPointerUp = (targetId: string) => {
-    if (!linkDragging) {
-      return
-    }
-
-    addLinkByDrag(linkDragging.fromId, targetId)
-    setLinkDragging(null)
-  }
-
-  const onVisualizeTabContextMenu = (event: React.MouseEvent<HTMLElement>) => {
-    event.preventDefault()
-    const graph = graphRef.current
-    if (!graph) {
-      return
-    }
-
-    const rect = graph.getBoundingClientRect()
-    const graphX = event.clientX - rect.left + graph.scrollLeft - 84
-    const graphY = event.clientY - rect.top + graph.scrollTop - 26
-
-    setTabMenu({
-      open: true,
-      x: event.clientX,
-      y: event.clientY,
-      graphX: Math.max(8, graphX),
-      graphY: Math.max(8, graphY),
+  const createTaskRemote = async () => {
+    const response = await fetch(`/api/projects/${activeProject.id}/tasks`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        title: 'New CPM Node',
+        description: '',
+        status: 'todo',
+        durationDays: 1,
+        assigneeId: state.currentUserId,
+      }),
     })
+    if (response.ok) {
+      const data = await response.json()
+      dispatch({
+        type: 'updateTask',
+        taskId: data.task.id,
+        patch: {},
+      })
+      window.location.reload()
+    }
   }
 
-  const clearAll = () => {
-    setTasks([])
-    setTaskLinks([])
-    setNodePositions({})
-    cancelRename()
-    setTabMenu({ open: false, x: 0, y: 0, graphX: 30, graphY: 30 })
-  }
-
-  const askAndAddRootFromMenu = () => {
-    const task = createTask('New')
-    setTasks((prev) => [...prev, task])
-    setNodePositions((prev) => ({ ...prev, [task.id]: { x: tabMenu.graphX, y: tabMenu.graphY } }))
-    setEditingId(task.id)
-    setEditingTitle('New')
-    setTabMenu({ open: false, x: 0, y: 0, graphX: 30, graphY: 30 })
-  }
-
-  const renderVisualPanelNodes = (nodes: TaskNode[], level = 0): React.ReactNode => {
-    return nodes.map((node) => {
-      const collapsed = Boolean(visualCollapsed[node.id])
-
-      return (
-        <li key={node.id} className="xt-visual-row" style={{ marginLeft: `${level * 12}px` }}>
-          <div className="xt-visual-row-main">
-            <input type="checkbox" checked={node.completed} onChange={() => toggle(node.id)} className="xt-check" spellCheck={false} />
-            {editingId === node.id ? (
-              <input
-                className="xt-inline-title-input xt-inline-visual"
-                value={editingTitle}
-                onChange={(event) => setEditingTitle(event.target.value)}
-                onBlur={submitRename}
-                spellCheck={false}
-                onKeyDown={(event) => {
-                  if (event.key === 'Enter') {
-                    submitRename()
-                  }
-                  if (event.key === 'Escape') {
-                    cancelRename()
-                  }
-                }}
-                autoFocus
-              />
-            ) : (
-              <button
-                className={node.completed ? 'xt-task-done xt-title-btn' : 'xt-task-title xt-title-btn'}
-                type="button"
-                onClick={() => startRename(node.id, node.title)}
-                onMouseEnter={(event) => showHoverCard(node, event.currentTarget, true)}
-                onMouseLeave={hideHoverCard}
-              >
-                {node.title}
-              </button>
-            )}
-          </div>
-          <div className="xt-visual-row-actions">
-            <button
-              className="xt-mini-btn"
-              type="button"
-              onClick={() => {
-                openVisualCollapse(node.id)
-                addChildNew(node.id)
-              }}
-              title="Add subtask"
-            >
-              <AddIcon />
-            </button>
-            <button className="xt-mini-btn xt-danger xt-delete-btn" type="button" onClick={() => remove(node.id)} title="Delete">
-              <DeleteIcon />
-            </button>
-            {node.children.length > 0 && (
-              <button className="xt-mini-btn" type="button" onClick={() => toggleVisualCollapse(node.id)} title="Collapse subtasks">
-                <CollapseIcon collapsed={collapsed} />
-              </button>
-            )}
-          </div>
-          {!collapsed && node.children.length > 0 && <ul className="xt-visual-tree">{renderVisualPanelNodes(node.children, level + 1)}</ul>}
-        </li>
-      )
+  const createProjectRemote = async () => {
+    const name = prompt('Enter project name:')
+    if (!name) return
+    const response = await fetch('/api/projects', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
     })
+    if (response.ok) {
+      const data = await response.json()
+      dispatch({ type: 'addProject', project: data.project })
+      dispatch({ type: 'switchProject', projectId: data.project.id })
+    }
   }
 
   return (
-    <main className="xt-page">
-      <header className="xt-topbar">
-        <button className="xt-logo" type="button">X</button>
-        <div className="xt-brand">XTasks</div>
-        <nav className="xt-top-actions">
-          <button className={`xt-outline-btn ${activeTab === 'list' ? 'xt-tab-active' : ''}`} type="button" onClick={() => setActiveTab('list')}>
-            List
-          </button>
-          <button className={`xt-outline-btn ${activeTab === 'visualize' ? 'xt-tab-active' : ''}`} type="button" onClick={() => setActiveTab('visualize')}>
-            Visualize
-          </button>
-        </nav>
-        <input className="xt-search" placeholder="Search users" />
-        <button className="xt-profile" type="button">Profile</button>
+    <main className={state.darkMode ? 'min-h-screen bg-slate-900 text-slate-100' : 'min-h-screen bg-slate-50 text-slate-900'}>
+      <header className={state.darkMode ? 'rounded-3xl border border-violet-700/40 bg-slate-900/80 p-5 shadow-xl backdrop-blur' : 'rounded-3xl border border-white/60 bg-white/70 p-5 shadow-xl backdrop-blur'}>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h1 className="text-3xl font-black tracking-tight sm:text-4xl">XTASKS</h1>
+            <p className="text-sm opacity-80">Shared critical-path project cockpit for high-velocity teams.</p>
+          </div>
+          <div className="flex items-center gap-2">
+            <select
+              value={state.activeProjectId}
+              onChange={(event) => dispatch({ type: 'switchProject', projectId: event.target.value })}
+              className="rounded-xl border bg-transparent px-3 py-2 text-sm font-semibold"
+            >
+              {state.projects.map((project) => (
+                <option key={project.id} value={project.id}>{project.name}</option>
+              ))}
+            </select>
+            <button className="rounded-xl border px-3 py-2 text-sm font-semibold transition hover:scale-105" type="button" onClick={createProjectRemote}>
+              New Project
+            </button>
+            {canManageProject && (
+              <button className="rounded-xl border px-3 py-2 text-sm font-semibold transition hover:scale-105" type="button" onClick={createTaskRemote}>
+                <PlusIcon />
+                Create Task
+              </button>
+            )}
+            <select
+              value={state.currentUserId}
+              onChange={(event) => dispatch({ type: 'switchUser', userId: event.target.value })}
+              className="rounded-xl border bg-transparent px-3 py-2 text-sm font-semibold"
+            >
+              {state.users.map((user) => (
+                <option key={user.id} value={user.id}>{user.name} ({user.role})</option>
+              ))}
+            </select>
+            <button className="rounded-xl border px-3 py-2 text-sm font-semibold transition hover:scale-105" type="button" onClick={() => dispatch({ type: 'toggleTheme' })}>
+              {state.darkMode ? 'Light' : 'Dark'} Mode
+            </button>
+            <button className="rounded-xl border px-3 py-2 text-sm font-semibold transition hover:scale-105" type="button" onClick={() => signOut({ callbackUrl: '/login' })}>
+              Sign out
+            </button>
+          </div>
+        </div>
       </header>
 
-      <p className="xt-subtitle">Manage your tasks with node visualization</p>
-
-      <section className="xt-content xt-single">
-        {activeTab === 'list' && (
-          <div className="xt-panel">
-            <h2>Task List</h2>
-            <div className="xt-list-toolbar">
-              <button type="button" className="xt-mini-btn xt-context-danger" onClick={clearAll}>
-                Clear all
-              </button>
-            </div>
-            {tasks.length === 0 && <p className="xt-empty-note">No tasks yet. Use the + button to create your first root task.</p>}
-            <TaskTreeList
-              tasks={tasks}
-              onToggle={toggle}
-              onDelete={remove}
-              onAddRoot={addRootNew}
-              onAddChild={addChildNew}
-              onSetDescription={setDescription}
-              onHoverTaskStart={showHoverCard}
-              onHoverTaskEnd={hideHoverCard}
-            />
+      <section className="grid gap-4 lg:grid-cols-3">
+        <article className={state.darkMode ? 'rounded-2xl border border-emerald-600/30 bg-emerald-950/30 p-4 shadow-lg' : 'rounded-2xl border border-emerald-200 bg-emerald-50/80 p-4 shadow-lg'}>
+          <p className="text-xs font-bold uppercase tracking-widest opacity-75">Project Timeline</p>
+          <p className="mt-1 text-3xl font-black">{criticalPath.totalDuration} days</p>
+          <p className="mt-1 text-sm opacity-80">Critical chain: {criticalPath.chain.map((id) => state.tasks.find((task) => task.id === id)?.title ?? id).join(' -> ') || 'N/A'}</p>
+        </article>
+        <article className={state.darkMode ? 'rounded-2xl border border-cyan-500/30 bg-cyan-950/30 p-4 shadow-lg' : 'rounded-2xl border border-cyan-200 bg-cyan-50/80 p-4 shadow-lg'}>
+          <p className="text-xs font-bold uppercase tracking-widest opacity-75">Shared Progress</p>
+          <p className="mt-1 text-3xl font-black">{completionRate}%</p>
+          <div className="h-2 rounded-full bg-black/10">
+            <div className="h-2 rounded-full bg-cyan-500 transition-all duration-500" style={{ width: `${completionRate}%` }} />
           </div>
-        )}
-
-        {activeTab === 'visualize' && (
-          <div className="xt-panel xt-panel-visual">
-            <h2>Task Visualization</h2>
-            <p className="xt-note">Right-click inside the workspace to open actions. Drag from the small circle on a root task to another root task to create a dependency link.</p>
-            <div
-              ref={graphRef}
-              className="xt-graph"
-              style={{ height: `${graphHeight}px` }}
-              onContextMenu={onVisualizeTabContextMenu}
-            >
-              <svg className="xt-edges" width="100%" height="100%" aria-hidden>
-                <defs>
-                  <marker id="xt-arrow" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
-                    <path d="M 0 0 L 7 3 L 0 6 z" fill="#1e3a8a" />
-                  </marker>
-                  <marker id="xt-arrow-soft" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto" markerUnits="strokeWidth">
-                    <path d="M 0 0 L 6 3 L 0 6 z" fill="#4e75c4" />
-                  </marker>
-                  <linearGradient id="xt-link-gradient" x1="0" x2="1" y1="0" y2="1">
-                    <stop offset="0%" stopColor="#1e3a8a" />
-                    <stop offset="100%" stopColor="#2563eb" />
-                  </linearGradient>
-                </defs>
-                {taskLinks.map((link) => {
-                  const from = nodePositions[link.from] ?? defaultPoints[link.from]
-                  const to = nodePositions[link.to] ?? defaultPoints[link.to]
-                  if (!from || !to) {
-                    return null
-                  }
-
-                  const nodeCenterY = 38
-                  const startX = from.x + 176
-                  const startY = from.y + nodeCenterY
-                  const endX = to.x
-                  const endY = to.y + nodeCenterY
-                  const c1 = startX + 38
-                  const c2 = endX - 38
-
-                  if (Math.abs(startY - endY) < 2) {
-                    return null
-                  }
-
-                  return (
-                    <path
-                      key={link.id}
-                      d={`M ${startX} ${startY} C ${c1} ${startY}, ${c2} ${endY}, ${endX} ${endY}`}
-                      stroke="url(#xt-link-gradient)"
-                      strokeWidth="1.2"
-                      fill="none"
-                      markerEnd="url(#xt-arrow)"
-                      strokeLinecap="round"
-                    />
-                  )
-                })}
-
-                {linkDragging && (() => {
-                  const from = nodePositions[linkDragging.fromId] ?? defaultPoints[linkDragging.fromId]
-                  if (!from) {
-                    return null
-                  }
-
-                  const nodeCenterY = 38
-                  const startX = from.x + 176
-                  const startY = from.y + nodeCenterY
-                  const endX = linkDragging.x
-                  const endY = linkDragging.y
-                  const c1 = startX + 50
-                  const c2 = endX - 50
-
-                  return (
-                    <path
-                      d={`M ${startX} ${startY} C ${c1} ${startY}, ${c2} ${endY}, ${endX} ${endY}`}
-                      stroke="url(#xt-link-gradient)"
-                      strokeWidth="1.1"
-                      fill="none"
-                      strokeLinecap="round"
-                    />
-                  )
-                })()}
-              </svg>
-
-              {tasks.map((node) => {
-                const point = nodePositions[node.id] ?? defaultPoints[node.id]
-                return (
-                  <div
-                    key={node.id}
-                    className={`xt-node ${node.completed ? 'xt-node-done' : ''}`}
-                    style={{ left: `${point.x}px`, top: `${point.y}px` }}
-                    onPointerDown={(event) => beginDrag(event, node.id)}
-                    onPointerUp={() => onRootPointerUp(node.id)}
-                  >
-                    <div className="xt-node-grip" title="Drag node">::</div>
-                    <button className="xt-link-handle" type="button" title="Drag to create dependency" onPointerDown={(event) => beginLinkDrag(event, node.id)} />
-                    <div className="xt-node-line">
-                      <input type="checkbox" checked={node.completed} onChange={() => toggle(node.id)} className="xt-check" />
-                      {editingId === node.id ? (
-                        <input
-                          className="xt-inline-title-input xt-inline-visual"
-                          style={{ width: '100px' }}
-                          value={editingTitle}
-                          onChange={(event) => setEditingTitle(event.target.value)}
-                          onBlur={submitRename}
-                          spellCheck={false}
-                          onKeyDown={(event) => {
-                            if (event.key === 'Enter') {
-                              submitRename()
-                            }
-                            if (event.key === 'Escape') {
-                              cancelRename()
-                            }
-                          }}
-                          autoFocus
-                        />
-                      ) : (
-                        <button
-                          className="xt-node-title"
-                          type="button"
-                          onClick={() => startRename(node.id, node.title)}
-                          onMouseEnter={(event) => showHoverCard(node, event.currentTarget, true)}
-                          onMouseLeave={hideHoverCard}
-                        >
-                          {node.title}
-                        </button>
-                      )}
-                    </div>
-                    <div className="xt-node-actions">
-                      {node.children.length > 0 && (
-                        <button className="xt-mini-btn" type="button" onClick={() => setVisualWindowRootId(visualWindowRootId === node.id ? null : node.id)} title="Toggle task details">
-                          <CollapseIcon collapsed={visualWindowRootId !== node.id} />
-                        </button>
-                      )}
-                      <button className="xt-mini-btn" type="button" onClick={() => addChildNew(node.id)} title="Add subtask">
-                        <AddIcon />
-                      </button>
-                      <button className="xt-mini-btn xt-danger xt-delete-btn" type="button" onClick={() => remove(node.id)} title="Delete">
-                        <DeleteIcon />
-                      </button>
-                    </div>
-                  </div>
-                )
-              })}
-
-              {activeTab === 'visualize' && visualWindowRootId && (() => {
-                const root = findTaskById(tasks, visualWindowRootId)
-                if (!root) {
-                  return null
-                }
-
-                const point = nodePositions[root.id] ?? defaultPoints[root.id]
-                const width = 148
-                const estimatedHeight = Math.min(240, 80 + root.children.length * 38)
-                const belowY = point.y + 72
-                const top = belowY
-                const left = Math.max(8, point.x + Math.floor((176 - width) / 2))
-
-                return (
-                  <section className="xt-visual-drawer xt-visual-drawer-floating" style={{ left: `${left}px`, top: `${top}px`, width: `${width}px` }}>
-                    {root.children.length === 0 && <p className="xt-empty-note">No subtasks yet.</p>}
-                    {root.children.length > 0 && <ul className="xt-visual-tree xt-window-list">{renderVisualPanelNodes(root.children)}</ul>}
-                  </section>
-                )
-              })()}
-
-              {tasks.length === 0 && <div className="xt-visual-empty">No tasks yet. Right-click the workspace and choose Add new task.</div>}
-            </div>
-
-            <div className="xt-link-list">
-              {taskLinks.map((link) => {
-                const fromName = rootTasks.find((task) => task.id === link.from)?.title ?? 'Unknown'
-                const toName = rootTasks.find((task) => task.id === link.to)?.title ?? 'Unknown'
-
-                return (
-                  <div key={link.id} className="xt-link-chip">
-                    <span>
-                      {fromName}
-                      {' -> '}
-                      {toName}
-                    </span>
-                    <button type="button" className="xt-mini-btn xt-danger" onClick={() => removeLink(link.id)}>
-                      x
-                    </button>
-                  </div>
-                )
-              })}
-            </div>
-            <p className="xt-note">Hover a task to edit or view its description in a floating card. Click a subtask name to rename it. Checking a root task also marks all of its subtasks as done.</p>
-          </div>
-        )}
+        </article>
+        <article className={state.darkMode ? 'rounded-2xl border border-violet-500/30 bg-violet-950/30 p-4 shadow-lg' : 'rounded-2xl border border-violet-200 bg-violet-50/80 p-4 shadow-lg'}>
+          <p className="text-xs font-bold uppercase tracking-widest opacity-75">Current Role</p>
+          <p className="mt-1 text-2xl font-black">{currentUser?.role === 'owner' ? 'Project Owner' : currentUser?.role === 'lead' ? 'Team Lead Controls' : 'Member Task Focus'}</p>
+          <p className="mt-1 text-sm opacity-80">{currentUser?.role === 'owner' ? 'Full project control, manage members and settings.' : currentUser?.role === 'lead' ? 'Create nodes, wire dependencies, assign ownership.' : 'Edit assigned tasks, update progress, flag blockers.'}</p>
+        </article>
       </section>
 
-      {hoverCard && (() => {
-        const task = findTaskById(tasks, hoverCard.taskId)
-        if (!task) {
-          return null
-        }
-
-        return (
-          <div className="xt-hover-card" style={{ left: `${hoverCard.x}px`, top: `${hoverCard.y}px` }} onMouseEnter={keepHoverCardOpen} onMouseLeave={hideHoverCard}>
-            <div className="xt-hover-title">{task.title}</div>
-            {hoverCard.editable && hoverCardEditMode ? (
-              <textarea
-                className="xt-hover-edit"
-                value={task.description}
-                onChange={(event) => setDescription(task.id, event.target.value)}
-                placeholder="Click to edit description..."
-                spellCheck={false}
-                 onMouseEnter={keepHoverCardOpen}
-                 autoFocus
-              />
-            ) : (
-              <div className="xt-hover-body" onClick={() => {
-                if (hoverCard.editable) {
-                  keepHoverCardOpen()
-                  setHoverCardEditMode(true)
-                }
-              }} style={{ cursor: hoverCard.editable ? 'pointer' : 'default' }}>
-                {task.description || (hoverCard.editable ? 'Click to add description...' : 'No description')}
-              </div>
-            )}
-          </div>
-        )
-      })()}
-
-      {tabMenu.open && (
-        <div className="xt-context-menu" style={{ left: `${tabMenu.x}px`, top: `${tabMenu.y}px` }}>
-          <button type="button" className="xt-context-item" onClick={askAndAddRootFromMenu}>
-            Add new task
-          </button>
-          <button type="button" className="xt-context-item xt-context-danger" onClick={clearAll}>
-            Clear all
-          </button>
+      <section className={state.darkMode ? 'overflow-auto rounded-3xl border border-violet-700/40 bg-slate-900/70 p-4 shadow-xl' : 'overflow-auto rounded-3xl border border-white/60 bg-white/70 p-4 shadow-xl'}>
+        <div className="mb-2 flex items-center justify-between">
+          <p className="text-sm font-bold uppercase tracking-wider opacity-70">CPM Dependency Graph</p>
+          <p className="text-xs opacity-70">Start -&gt; Sequence -&gt; End</p>
         </div>
+        <div className="relative min-h-[620px] min-w-[980px] rounded-2xl border border-dashed border-cyan-300/50 bg-gradient-to-br from-transparent via-cyan-500/5 to-violet-500/10 p-2">
+          <div className="absolute left-4 top-4 rounded-full bg-cyan-500 px-3 py-1 text-xs font-bold text-white">START</div>
+          <div className="absolute right-4 top-4 rounded-full bg-violet-500 px-3 py-1 text-xs font-bold text-white">END</div>
+          <svg className="absolute inset-0 h-full w-full" aria-hidden>
+            <defs>
+              <marker id="arrow-cpm" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+                <path d="M0 0 L7 3 L0 6z" fill={state.darkMode ? '#22d3ee' : '#0e7490'} />
+              </marker>
+            </defs>
+            {state.tasks.flatMap((task) =>
+              task.dependencyIds.map((depId) => {
+                const from = graphNodes[depId]
+                const to = graphNodes[task.id]
+                if (!from || !to) return null
+                const sx = from.x + 220
+                const sy = from.y + 60
+                const ex = to.x
+                const ey = to.y + 60
+                return (
+                  <path
+                    key={`${depId}-${task.id}`}
+                    d={`M ${sx} ${sy} C ${sx + 80} ${sy}, ${ex - 80} ${ey}, ${ex} ${ey}`}
+                    stroke={state.darkMode ? '#22d3ee' : '#06b6d4'}
+                    strokeWidth="2"
+                    fill="none"
+                    markerEnd="url(#arrow-cpm)"
+                  />
+                )
+              }),
+            )}
+          </svg>
+
+          {state.tasks.map((task) => {
+            const userCanEditTask = canManageProject || task.assigneeId === currentUser?.id
+            const locked = taskLocked(task, state.tasks)
+            const isCritical = criticalPath.chain.includes(task.id)
+
+            const nodeStateClass = task.status === 'done'
+              ? 'border-emerald-300 bg-emerald-100 text-emerald-900 shadow-emerald-200 animate-pulse'
+              : task.status === 'blocked'
+              ? 'border-red-300 bg-red-100 text-red-900'
+              : locked
+              ? 'border-slate-300 bg-slate-200 text-slate-500'
+              : 'border-cyan-300 bg-white/90 text-slate-900'
+
+            return (
+              <button
+                key={task.id}
+                type="button"
+                onClick={() => {
+                  dispatch({ type: 'openTask', taskId: task.id })
+                }}
+                className={`absolute w-[220px] rounded-2xl border-2 p-3 text-left shadow-lg backdrop-blur transition duration-200 hover:-translate-y-1 hover:scale-[1.01] ${nodeStateClass} ${isCritical ? 'ring-2 ring-fuchsia-400' : ''}`}
+                style={{ left: graphNodes[task.id]?.x ?? 100, top: graphNodes[task.id]?.y ?? 100 }}
+              >
+                <div className="mb-1 flex items-start justify-between gap-1">
+                  <p className="line-clamp-2 text-sm font-extrabold">{task.title}</p>
+                  {task.status === 'blocked' && (
+                    <span className="inline-flex items-center gap-1 rounded-full bg-red-500 px-2 py-0.5 text-[10px] font-bold text-white">
+                      <FlagIcon />
+                      Blocked
+                    </span>
+                  )}
+                </div>
+                <p className="text-xs opacity-80">Owner: {state.users.find((u) => u.id === task.assigneeId)?.name ?? 'Unassigned'}</p>
+                <p className="text-xs opacity-80">Duration: {task.duration}d</p>
+                <p className="text-xs opacity-80">Depends on: {task.dependencyIds.length}</p>
+                <div className="mt-2 flex items-center justify-between">
+                  <span className="rounded-full bg-black/10 px-2 py-0.5 text-[10px] font-bold uppercase">{task.status.replace('_', ' ')}</span>
+                  <label className="flex items-center gap-1 text-xs font-semibold">
+                    <input
+                      type="checkbox"
+                      checked={task.status === 'done'}
+                      disabled={locked || !userCanEditTask}
+                      onChange={(event) => {
+                        event.stopPropagation()
+                        dispatch({ type: 'toggleTaskDone', taskId: task.id })
+                        void persistTask(task.id, { status: task.status === 'done' ? 'in_progress' : 'done' })
+                      }}
+                    />
+                    {locked ? 'Locked' : 'Done'}
+                  </label>
+                </div>
+              </button>
+            )
+          })}
+        </div>
+      </section>
+
+      {selectedTask && (
+        <TaskModal
+          state={state}
+          task={selectedTask}
+          canEdit={canManageProject || selectedTask.assigneeId === currentUser?.id}
+          onClose={() => dispatch({ type: 'openTask', taskId: null })}
+          dispatch={dispatch}
+          onPatchTask={(taskId, patch) => {
+            void persistTask(taskId, patch)
+          }}
+        />
       )}
     </main>
   )

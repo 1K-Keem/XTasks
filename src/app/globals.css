@@ -15,7 +15,7 @@
 
 body {
 	margin: 0;
-	font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+	font-family: Inter, 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
 	background:
 		radial-gradient(circle at 20% 10%, #e8f0ff 0%, rgba(232, 240, 255, 0) 30%),
 		radial-gradient(circle at 90% 80%, #dfe9ff 0%, rgba(223, 233, 255, 0) 35%),
