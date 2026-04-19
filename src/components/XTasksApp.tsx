@@ -1,9 +1,10 @@
 'use client'
 
 import { signOut } from 'next-auth/react'
-import { useCallback, useEffect, useMemo, useReducer, useState } from 'react'
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react'
 import { computeCPM } from '../lib/cpm'
 import EmptyProjectState from './EmptyProjectState'
+import InvitationsModal from './InvitationsModal'
 import JoinProjectModal from './JoinProjectModal'
 import ProjectFlowCanvas from './flow/ProjectFlowCanvas'
 import ProjectSettingsModal from './ProjectSettingsModal'
@@ -160,12 +161,18 @@ function appReducer(state: AppState, action: AppAction): AppState {
   }
 }
 
-function mapTaskFromApi(task: Record<string, unknown>, fallbackUserId: string): TaskNode {
+function mapTaskFromApi(task: Record<string, unknown>): TaskNode {
+  const assigneeIds = Array.isArray(task.assigneeIds)
+    ? (task.assigneeIds as string[])
+    : task.assigneeId
+      ? [String(task.assigneeId)]
+      : []
+
   return {
     id: String(task.id),
     title: String(task.title),
     duration: Number(task.durationDays ?? 1),
-    assigneeId: (task.assigneeId as string | null) ?? fallbackUserId,
+    assigneeIds,
     status: task.status as TaskStatus,
     dependencyIds: Array.isArray(task.dependencies)
       ? (task.dependencies as { dependsOnTaskId: string }[]).map((d) => d.dependsOnTaskId)
@@ -220,6 +227,11 @@ export default function XTasksApp({
   const [shareOpen, setShareOpen] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [joinOpen, setJoinOpen] = useState(false)
+  const [invitesOpen, setInvitesOpen] = useState(false)
+  const [rolePanelOpen, setRolePanelOpen] = useState(false)
+  const [inviteCount, setInviteCount] = useState(0)
+  const [interactionLocked, setInteractionLocked] = useState(false)
+  const rolePanelRef = useRef<HTMLDivElement | null>(null)
 
   const refreshProjects = useCallback(async () => {
     const res = await fetch('/api/projects')
@@ -234,9 +246,9 @@ export default function XTasksApp({
     const res = await fetch(`/api/projects/${state.activeProjectId}/tasks`)
     if (!res.ok) return
     const data = await res.json()
-    const tasks = (data?.tasks ?? []).map((task: Record<string, unknown>) => mapTaskFromApi(task, state.currentUserId))
+    const tasks = (data?.tasks ?? []).map((task: Record<string, unknown>) => mapTaskFromApi(task))
     dispatch({ type: 'loadTasks', tasks })
-  }, [state.activeProjectId, state.currentUserId])
+  }, [state.activeProjectId])
 
   const refreshMembers = useCallback(async () => {
     if (!state.activeProjectId) return
@@ -247,6 +259,21 @@ export default function XTasksApp({
     if (users.length) dispatch({ type: 'loadUsers', users })
   }, [state.activeProjectId])
 
+  const refreshInviteCount = useCallback(async () => {
+    const res = await fetch('/api/invitations')
+    if (!res.ok) return
+    const data = await res.json()
+    setInviteCount(Array.isArray(data?.invites) ? data.invites.length : 0)
+  }, [])
+
+  const refreshInteractionLock = useCallback(async () => {
+    if (!state.activeProjectId) return
+    const res = await fetch(`/api/projects/${state.activeProjectId}/interaction-lock`)
+    if (!res.ok) return
+    const data = await res.json().catch(() => ({}))
+    setInteractionLocked(Boolean(data?.locked))
+  }, [state.activeProjectId])
+
   useEffect(() => {
     void refreshTasks()
   }, [refreshTasks])
@@ -255,9 +282,132 @@ export default function XTasksApp({
     void refreshMembers()
   }, [refreshMembers])
 
+  useEffect(() => {
+    void refreshInviteCount()
+  }, [refreshInviteCount])
+
+  useEffect(() => {
+    void refreshInteractionLock()
+  }, [refreshInteractionLock])
+
+  useEffect(() => {
+    const onFocus = () => {
+      void refreshInviteCount()
+    }
+
+    const interval = setInterval(() => {
+      void refreshInviteCount()
+    }, 10000)
+
+    window.addEventListener('focus', onFocus)
+    document.addEventListener('visibilitychange', onFocus)
+
+    return () => {
+      clearInterval(interval)
+      window.removeEventListener('focus', onFocus)
+      document.removeEventListener('visibilitychange', onFocus)
+    }
+  }, [refreshInviteCount])
+
+  useEffect(() => {
+    if (!rolePanelOpen) return
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setRolePanelOpen(false)
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [rolePanelOpen])
+
+  useEffect(() => {
+    if (!rolePanelOpen) return
+
+    const onPointerDown = (event: PointerEvent) => {
+      if (!rolePanelRef.current) return
+      const target = event.target
+      if (target instanceof Node && !rolePanelRef.current.contains(target)) {
+        setRolePanelOpen(false)
+      }
+    }
+
+    document.addEventListener('pointerdown', onPointerDown, true)
+    return () => document.removeEventListener('pointerdown', onPointerDown, true)
+  }, [rolePanelOpen])
+
+  useEffect(() => {
+    if (!state.activeProjectId) return
+
+    const source = new EventSource(`/api/projects/${state.activeProjectId}/events`)
+    let refreshTimer: ReturnType<typeof setTimeout> | null = null
+
+    const scheduleRefresh = () => {
+      if (refreshTimer) return
+      refreshTimer = setTimeout(() => {
+        refreshTimer = null
+        void refreshTasks()
+      }, 120)
+    }
+
+    source.addEventListener('project_event', (event) => {
+      try {
+        const payload = JSON.parse((event as MessageEvent<string>).data) as {
+          type?: string
+          removedUserId?: string
+          interactionLocked?: boolean
+        }
+
+        if (payload.type === 'member_removed') {
+          void refreshMembers()
+          if (payload.removedUserId === state.currentUserId) {
+            dispatch({ type: 'removeProject', projectId: state.activeProjectId })
+            void refreshProjects()
+            return
+          }
+        }
+
+        if (payload.type === 'member_role_updated') {
+          void refreshMembers()
+          void refreshProjects()
+        }
+
+        if (payload.type === 'interaction_lock_updated') {
+          if (typeof payload.interactionLocked === 'boolean') {
+            setInteractionLocked(payload.interactionLocked)
+          } else {
+            void refreshInteractionLock()
+          }
+        }
+      } catch {
+        // Ignore parse errors for non-data keepalive messages.
+      }
+      scheduleRefresh()
+    })
+
+    return () => {
+      source.close()
+      if (refreshTimer) clearTimeout(refreshTimer)
+    }
+  }, [state.activeProjectId, state.currentUserId, refreshInteractionLock, refreshMembers, refreshProjects, refreshTasks])
+
   const activeProject = state.projects.find((p) => p.id === state.activeProjectId)
   const activeProjectRole = activeProject?.role ?? 'member'
   const canManageProject = activeProjectRole === 'owner' || activeProjectRole === 'lead'
+
+  const toggleInteractionLock = useCallback(
+    async (locked: boolean) => {
+      if (!state.activeProjectId || !canManageProject) return
+      const previous = interactionLocked
+      setInteractionLocked(locked)
+      const res = await fetch(`/api/projects/${state.activeProjectId}/interaction-lock`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ locked }),
+      })
+      if (!res.ok) {
+        setInteractionLocked(previous)
+      }
+    },
+    [canManageProject, interactionLocked, state.activeProjectId],
+  )
 
   const selectedTask = state.tasks.find((task) => task.id === state.selectedTaskId) ?? null
 
@@ -273,8 +423,14 @@ export default function XTasksApp({
     )
   }, [state.tasks, completedIds])
 
-  const assigneeName = useCallback(
-    (id: string) => state.users.find((u) => u.id === id)?.name ?? 'Unassigned',
+  const assigneeNames = useCallback(
+    (ids: string[]) => {
+      if (ids.length === 0) return 'Unassigned'
+      const labels = ids
+        .map((id) => state.users.find((u) => u.id === id)?.name)
+        .filter((name): name is string => Boolean(name))
+      return labels.length > 0 ? labels.join(', ') : 'Unassigned'
+    },
     [state.users],
   )
 
@@ -287,7 +443,7 @@ export default function XTasksApp({
         description: patch.notes,
         status: patch.status,
         durationDays: patch.duration,
-        assigneeId: patch.assigneeId,
+        assigneeIds: patch.assigneeIds,
         subtasksJson: patch.subtasks ? JSON.stringify(patch.subtasks) : undefined,
         commentsJson: patch.comments ? JSON.stringify(patch.comments) : undefined,
         dependencyIds: patch.dependencyIds,
@@ -304,6 +460,7 @@ export default function XTasksApp({
   }
 
   const deleteTaskRemote = async (taskId: string) => {
+    if (interactionLocked) return
     const res = await fetch(`/api/tasks/${taskId}`, { method: 'DELETE' })
     if (res.ok) {
       dispatch({ type: 'deleteTask', taskId })
@@ -312,14 +469,20 @@ export default function XTasksApp({
 
   const onDependencyChange = useCallback(
     (taskId: string, nextDependencyIds: string[]) => {
+      if (interactionLocked) return
       dispatch({ type: 'updateTask', taskId, patch: { dependencyIds: nextDependencyIds } })
       void persistTask(taskId, { dependencyIds: nextDependencyIds })
     },
-    [],
+    [interactionLocked],
   )
 
-  const createRootTask = async () => {
+  const createRootTask = async (position?: { x: number; y: number }) => {
+    if (interactionLocked) return
     if (!activeProject) return
+    const positioned = state.tasks.filter((task) => task.positionX != null && task.positionY != null)
+    const maxX = positioned.length > 0 ? Math.max(...positioned.map((task) => Number(task.positionX))) : 40
+    const minY = positioned.length > 0 ? Math.min(...positioned.map((task) => Number(task.positionY))) : 40
+
     const res = await fetch(`/api/projects/${activeProject.id}/tasks`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -328,13 +491,48 @@ export default function XTasksApp({
         description: '',
         status: 'todo',
         durationDays: 1,
-        assigneeId: state.currentUserId,
+        assigneeIds: [state.currentUserId],
+        positionX: position?.x ?? maxX + 300,
+        positionY: position?.y ?? minY,
       }),
     })
     if (res.ok) void refreshTasks()
   }
 
+  const autoLayoutTasks = (positions: Record<string, { x: number; y: number }>) => {
+    const tasks = state.tasks.map((task) => {
+      const nextPos = positions[task.id]
+      if (!nextPos) return task
+      return { ...task, positionX: nextPos.x, positionY: nextPos.y }
+    })
+
+    dispatch({ type: 'loadTasks', tasks })
+    for (const [taskId, pos] of Object.entries(positions)) {
+      void persistTask(taskId, { positionX: pos.x, positionY: pos.y })
+    }
+  }
+
+  const clearAllTasksRemote = async () => {
+    if (interactionLocked) return
+    if (state.tasks.length === 0) return
+    const confirmed = typeof window === 'undefined' ? false : window.confirm('Delete all tasks in this project?')
+    if (!confirmed) return
+
+    const ids = state.tasks.map((task) => task.id)
+    const responses = await Promise.all(ids.map((taskId) => fetch(`/api/tasks/${taskId}`, { method: 'DELETE' })))
+    if (responses.some((res) => !res.ok)) {
+      if (typeof window !== 'undefined') {
+        window.alert('Some tasks could not be deleted. Please try again.')
+      }
+      void refreshTasks()
+      return
+    }
+
+    dispatch({ type: 'loadTasks', tasks: [] })
+  }
+
   const onQuickAddChild = async (parentId: string) => {
+    if (interactionLocked) return
     if (!activeProject) return
     const parent = state.tasks.find((t) => t.id === parentId)
     const px = (parent?.positionX ?? 200) + 100
@@ -347,7 +545,7 @@ export default function XTasksApp({
         description: '',
         status: 'todo',
         durationDays: 1,
-        assigneeId: state.currentUserId,
+        assigneeIds: [state.currentUserId],
         dependencyIds: [parentId],
         positionX: px,
         positionY: py,
@@ -380,6 +578,26 @@ export default function XTasksApp({
     }
   }
 
+  const leaveProjectRemote = async () => {
+    if (!activeProject || activeProjectRole === 'owner') return
+    const confirmed = typeof window === 'undefined' ? false : window.confirm(`Leave project \"${activeProject.name}\"?`)
+    if (!confirmed) return
+
+    const res = await fetch(`/api/projects/${activeProject.id}/leave`, {
+      method: 'POST',
+    })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) {
+      if (typeof window !== 'undefined') {
+        window.alert(typeof data.error === 'string' ? data.error : 'Could not leave this project.')
+      }
+      return
+    }
+
+    dispatch({ type: 'removeProject', projectId: activeProject.id })
+    await refreshProjects()
+  }
+
   const emptyDashboard = state.projects.length === 0 || !state.activeProjectId
 
   if (emptyDashboard) {
@@ -388,8 +606,10 @@ export default function XTasksApp({
         <EmptyProjectState
           darkMode={state.darkMode}
           userLabel={state.currentUserName}
+          inviteCount={inviteCount}
           onCreateProject={() => void createProjectRemote()}
           onJoinProject={() => setJoinOpen(true)}
+          onOpenInvites={() => setInvitesOpen(true)}
           onToggleTheme={() => dispatch({ type: 'toggleTheme' })}
         />
         {joinOpen && (
@@ -402,6 +622,19 @@ export default function XTasksApp({
               setJoinOpen(false)
               void refreshProjects()
             }}
+          />
+        )}
+        {invitesOpen && (
+          <InvitationsModal
+            darkMode={state.darkMode}
+            onClose={() => setInvitesOpen(false)}
+            onAccepted={(project) => {
+              dispatch({ type: 'addProject', project })
+              dispatch({ type: 'switchProject', projectId: project.id })
+              setInvitesOpen(false)
+              void refreshProjects()
+            }}
+            onCountChanged={setInviteCount}
           />
         )}
       </>
@@ -422,7 +655,7 @@ export default function XTasksApp({
         <div className="flex flex-wrap items-center justify-between gap-4">
           <div>
             <p className="text-xs font-black uppercase tracking-[0.35em] text-fuchsia-500">XTasks</p>
-            <h1 className="text-3xl font-black tracking-tight">CPM command center</h1>
+            <h1 className="text-3xl font-black tracking-tight">Task Flow Workspace</h1>
             <p className="text-sm opacity-75">
               Logged in as <span className="font-semibold">{state.currentUserName}</span>
               {activeProject ? (
@@ -434,17 +667,37 @@ export default function XTasksApp({
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <select
-              value={state.activeProjectId}
-              onChange={(e) => dispatch({ type: 'switchProject', projectId: e.target.value })}
-              className="h-10 rounded-2xl border border-black/10 bg-transparent px-3 text-sm font-bold"
-            >
-              {state.projects.map((project) => (
-                <option key={project.id} value={project.id}>
-                  {project.name}
-                </option>
-              ))}
-            </select>
+            <div className="relative">
+              <select
+                value={state.activeProjectId}
+                onChange={(e) => dispatch({ type: 'switchProject', projectId: e.target.value })}
+                className={
+                  state.darkMode
+                    ? 'h-9 min-w-[120px] max-w-[156px] appearance-none rounded-xl border border-cyan-500/40 bg-slate-900 px-2.5 pr-7 text-xs font-bold text-slate-100 shadow-sm outline-none transition focus:border-cyan-300 focus:ring-2 focus:ring-cyan-400/30'
+                    : 'h-9 min-w-[120px] max-w-[156px] appearance-none rounded-xl border border-cyan-300 bg-white px-2.5 pr-7 text-xs font-bold text-slate-900 shadow-sm outline-none transition focus:border-cyan-400 focus:ring-2 focus:ring-cyan-300/35'
+                }
+              >
+                {state.projects.map((project) => (
+                  <option
+                    key={project.id}
+                    value={project.id}
+                    className={state.darkMode ? 'bg-slate-900 text-slate-100' : 'bg-white text-slate-900'}
+                  >
+                    {project.name}
+                  </option>
+                ))}
+              </select>
+              <span
+                aria-hidden
+                className={
+                  state.darkMode
+                    ? 'pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-cyan-200'
+                    : 'pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-cyan-600'
+                }
+              >
+                ▾
+              </span>
+            </div>
             <button
               type="button"
               className="h-10 rounded-2xl border border-black/10 px-3 text-sm font-bold transition hover:scale-[1.02]"
@@ -452,24 +705,35 @@ export default function XTasksApp({
             >
               New project
             </button>
-            {canManageProject && (
-              <button
-                type="button"
-                className="h-10 rounded-2xl border border-cyan-300/80 bg-cyan-50 px-3 text-sm font-bold text-cyan-900 dark:border-cyan-500/40 dark:bg-slate-800 dark:text-cyan-100"
-                onClick={() => void createRootTask()}
-              >
-                + Task
-              </button>
-            )}
             {activeProject && (
               <>
                 <button
                   type="button"
-                  className="h-10 rounded-2xl border border-fuchsia-300/80 px-3 text-sm font-bold"
-                  onClick={() => setShareOpen(true)}
+                  className={`h-10 rounded-2xl px-3 text-sm font-bold transition ${
+                    inviteCount > 0
+                      ? 'border border-rose-400 bg-rose-50 text-rose-700 shadow-sm shadow-rose-500/20 dark:border-rose-500/50 dark:bg-rose-950/40 dark:text-rose-200'
+                      : 'border border-amber-300/80'
+                  }`}
+                  onClick={() => setInvitesOpen(true)}
                 >
-                  Share
+                  <span className="inline-flex items-center gap-2">
+                    Invitations
+                    {inviteCount > 0 && (
+                      <span className="inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-rose-600 px-1 text-[9px] font-black leading-none text-white">
+                        {inviteCount > 99 ? '99+' : inviteCount}
+                      </span>
+                    )}
+                  </span>
                 </button>
+                {canManageProject && (
+                  <button
+                    type="button"
+                    className="h-10 rounded-2xl border border-fuchsia-300/80 px-3 text-sm font-bold"
+                    onClick={() => setShareOpen(true)}
+                  >
+                    Share
+                  </button>
+                )}
                 {activeProjectRole === 'owner' && (
                   <button
                     type="button"
@@ -481,6 +745,13 @@ export default function XTasksApp({
                 )}
               </>
             )}
+            <button
+              type="button"
+              className="h-10 rounded-2xl border border-black/10 px-3 text-sm font-bold"
+              onClick={() => setRolePanelOpen((open) => !open)}
+            >
+              Role
+            </button>
             <button
               type="button"
               className="h-10 rounded-2xl border border-black/10 px-3 text-sm font-bold"
@@ -510,7 +781,7 @@ export default function XTasksApp({
           <p className="text-xs font-bold uppercase tracking-widest opacity-70">Critical path length</p>
           <p className="mt-1 text-3xl font-black">{cpm.projectDuration} days</p>
           <p className="mt-2 text-xs opacity-75">
-            Timeline updates as durations and dependencies change. Highlighted nodes and edges follow the longest zero-slack chain.
+            Highlighted nodes and edges follow the longest zero-slack chain.
           </p>
         </article>
         <article
@@ -536,11 +807,17 @@ export default function XTasksApp({
               : 'rounded-3xl border border-violet-100 bg-violet-50/90 p-4 shadow-md'
           }
         >
-          <p className="text-xs font-bold uppercase tracking-widest opacity-70">How roles work here</p>
+          <p className="text-xs font-bold uppercase tracking-widest opacity-70">Role quick view</p>
           <p className="mt-2 text-sm opacity-85">
-            You are a <span className="font-bold capitalize">{activeProjectRole}</span> on this board. Global accounts stay neutral — ownership
-            only applies per project.
+            You are a <span className="font-bold capitalize">{activeProjectRole}</span> on this project.
           </p>
+          <button
+            type="button"
+            className="mt-3 h-9 rounded-2xl border border-violet-300/80 px-3 text-sm font-bold"
+            onClick={() => setRolePanelOpen(true)}
+          >
+            Role guide
+          </button>
         </article>
       </section>
 
@@ -550,21 +827,50 @@ export default function XTasksApp({
             <p className="text-sm font-black uppercase tracking-[0.2em] text-cyan-600 dark:text-cyan-300">Interactive graph</p>
             <p className="text-xs opacity-70">Drag nodes, connect handles, or tap + to spawn a dependent task.</p>
           </div>
+          <div className="flex items-center gap-2">
+            {activeProjectRole !== 'owner' && (
+              <button
+                type="button"
+                className="h-9 rounded-2xl border border-rose-300/80 px-3 text-sm font-bold text-rose-700 dark:text-rose-300"
+                onClick={() => void leaveProjectRemote()}
+              >
+                Leave project
+              </button>
+            )}
+          </div>
         </div>
-        <ProjectFlowCanvas
-          tasks={state.tasks}
-          darkMode={state.darkMode}
-          criticalIds={cpm.criticalTaskIds}
-          canManageProject={canManageProject}
-          currentUserId={state.currentUserId}
-          assigneeName={assigneeName}
-          onSelectTask={(id) => dispatch({ type: 'openTask', taskId: id })}
-          onPersistPosition={persistPosition}
-          onQuickAddChild={(parentId) => void onQuickAddChild(parentId)}
-          onToggleDone={onToggleDone}
-          onDeleteTask={(taskId) => void deleteTaskRemote(taskId)}
-          onDependencyChange={onDependencyChange}
-        />
+        <div className="relative">
+          {canManageProject && (
+            <button
+              type="button"
+              disabled={interactionLocked}
+              className="absolute left-3 top-3 z-20 h-9 rounded-2xl border border-cyan-300/80 bg-cyan-50 px-3 text-sm font-bold text-cyan-900 shadow-md dark:border-cyan-500/40 dark:bg-slate-800 dark:text-cyan-100"
+              onClick={() => void createRootTask()}
+            >
+              {interactionLocked ? 'Locked' : '+ Task'}
+            </button>
+          )}
+          <ProjectFlowCanvas
+            tasks={state.tasks}
+            darkMode={state.darkMode}
+            criticalIds={cpm.criticalTaskIds}
+            canManageProject={canManageProject}
+            interactionLocked={interactionLocked}
+            canToggleInteractionLock={canManageProject}
+            onToggleInteractionLock={(locked) => void toggleInteractionLock(locked)}
+            currentUserId={state.currentUserId}
+            assigneeNames={assigneeNames}
+            onSelectTask={(id) => dispatch({ type: 'openTask', taskId: id })}
+            onPersistPosition={persistPosition}
+            onQuickAddChild={(parentId) => void onQuickAddChild(parentId)}
+            onCreateTaskAt={(x, y) => void createRootTask({ x, y })}
+            onAutoLayout={autoLayoutTasks}
+            onClearAll={() => void clearAllTasksRemote()}
+            onToggleDone={onToggleDone}
+            onDeleteTask={(taskId) => void deleteTaskRemote(taskId)}
+            onDependencyChange={onDependencyChange}
+          />
+        </div>
       </section>
 
       {selectedTask && activeProject && (
@@ -573,11 +879,13 @@ export default function XTasksApp({
           task={selectedTask}
           members={state.users}
           tasks={state.tasks}
-          canEdit={canManageProject || selectedTask.assigneeId === state.currentUserId}
+          canEdit={!interactionLocked && (canManageProject || selectedTask.assigneeIds.includes(state.currentUserId))}
+          currentUserName={state.currentUserName}
           onClose={() => dispatch({ type: 'openTask', taskId: null })}
           onPatch={(taskId, patch) => dispatch({ type: 'updateTask', taskId, patch })}
           onPersist={(taskId, patch) => void persistTask(taskId, patch)}
           onDelete={(taskId) => {
+            if (interactionLocked) return
             void deleteTaskRemote(taskId)
             dispatch({ type: 'openTask', taskId: null })
           }}
@@ -599,13 +907,63 @@ export default function XTasksApp({
           darkMode={state.darkMode}
           projectName={activeProject.name}
           projectId={activeProject.id}
+          currentUserId={state.currentUserId}
           onClose={() => setSettingsOpen(false)}
+          onMembersChanged={() => {
+            void refreshMembers()
+            void refreshTasks()
+          }}
           onDeleted={async () => {
             setSettingsOpen(false)
             dispatch({ type: 'removeProject', projectId: activeProject.id })
             await refreshProjects()
           }}
         />
+      )}
+
+      {invitesOpen && (
+        <InvitationsModal
+          darkMode={state.darkMode}
+          onClose={() => setInvitesOpen(false)}
+          onAccepted={(project) => {
+            if (!state.projects.some((p) => p.id === project.id)) {
+              dispatch({ type: 'addProject', project })
+            }
+            dispatch({ type: 'switchProject', projectId: project.id })
+            setInvitesOpen(false)
+            void refreshProjects()
+          }}
+          onCountChanged={setInviteCount}
+        />
+      )}
+
+      {rolePanelOpen && (
+        <div
+          ref={rolePanelRef}
+          className={
+            state.darkMode
+              ? 'fixed right-5 top-24 z-40 w-[360px] rounded-3xl border border-violet-700/60 bg-slate-900/95 p-4 shadow-2xl backdrop-blur'
+              : 'fixed right-5 top-24 z-40 w-[360px] rounded-3xl border border-violet-200 bg-white/95 p-4 shadow-2xl backdrop-blur'
+          }
+        >
+          <div className="flex items-center justify-between gap-3">
+            <p className="text-sm font-black uppercase tracking-[0.18em] text-violet-500">Role Guide</p>
+          </div>
+          <p className="mt-2 text-sm opacity-85">
+            You are currently <span className="font-bold capitalize">{activeProjectRole}</span>.
+          </p>
+          <div className="mt-3 space-y-2 text-sm opacity-90">
+            <p>
+              <span className="font-bold">Owner:</span> manage members, remove members, invite teammates, create/delete tasks, and control project settings.
+            </p>
+            <p>
+              <span className="font-bold">Lead:</span> invite and remove members, create/delete tasks, and manage day-to-day board operations.
+            </p>
+            <p>
+              <span className="font-bold">Member:</span> view all tasks, and edit only tasks assigned to you.
+            </p>
+          </div>
+        </div>
       )}
     </main>
   )

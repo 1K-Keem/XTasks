@@ -53,7 +53,7 @@ export default async function DashboardPage() {
   const tasks = activeProjectId
     ? await prisma.task.findMany({
         where: { projectId: activeProjectId },
-        include: { dependencies: true },
+        include: { dependencies: true, assignees: true },
         orderBy: { createdAt: 'asc' },
       })
     : []
@@ -110,7 +110,7 @@ export default async function DashboardPage() {
         id: task.id,
         title: task.title,
         duration: task.durationDays,
-        assigneeId: task.assigneeId ?? session.user.id,
+        assigneeIds: task.assignees.length > 0 ? task.assignees.map((row) => row.userId) : task.assigneeId ? [task.assigneeId] : [],
         status: task.status as 'todo' | 'in_progress' | 'done' | 'blocked',
         dependencyIds: task.dependencies.map((dep) => dep.dependsOnTaskId),
         subtasks: (() => {

@@ -14,12 +14,14 @@ export default function ShareProjectModal({ darkMode, projectName, projectId, on
   const [email, setEmail] = useState('')
   const [role, setRole] = useState<'member' | 'lead'>('member')
   const [error, setError] = useState<string | null>(null)
+  const [message, setMessage] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
 
   const shell = darkMode ? 'border-violet-600/50 bg-slate-900 text-slate-50' : 'border-fuchsia-200 bg-white text-slate-900'
 
   const submit = async () => {
     setError(null)
+    setMessage(null)
     setLoading(true)
     try {
       const res = await fetch(`/api/projects/${projectId}/members`, {
@@ -33,6 +35,11 @@ export default function ShareProjectModal({ darkMode, projectName, projectId, on
         return
       }
       onInvited()
+      if (data?.alreadyMember) {
+        setMessage('User is already a member of this project.')
+      } else {
+        setMessage('Invitation sent. They can accept it from their Invitations inbox.')
+      }
       setEmail('')
     } finally {
       setLoading(false)
@@ -46,7 +53,7 @@ export default function ShareProjectModal({ darkMode, projectName, projectId, on
           <div>
             <p className="text-xs font-bold uppercase tracking-[0.25em] text-fuchsia-500">Share</p>
             <h2 className="text-2xl font-black tracking-tight">{projectName}</h2>
-            <p className="mt-1 text-sm opacity-70">Invite by email — they need an XTasks account first.</p>
+            <p className="mt-1 text-sm opacity-70">Invite by email — they need an XTasks account and can accept in their Invitations inbox.</p>
           </div>
           <button type="button" className="rounded-2xl border border-black/10 px-3 py-1 text-sm font-semibold" onClick={onClose}>
             Close
@@ -77,6 +84,7 @@ export default function ShareProjectModal({ darkMode, projectName, projectId, on
         </label>
 
         {error && <p className="mt-3 text-sm font-semibold text-rose-500">{error}</p>}
+  {message && <p className="mt-3 text-sm font-semibold text-emerald-600 dark:text-emerald-400">{message}</p>}
 
         <button
           type="button"

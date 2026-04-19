@@ -5,13 +5,14 @@ import { authOptions } from '../../../../../lib/auth'
 import { prisma } from '../../../../../lib/prisma'
 import { wouldCreateCycle } from '../../../../../lib/dag'
 import { canAccessProject } from '../../../../../lib/project-access'
+import { publishProjectEvent } from '../../../../../lib/realtime'
 
 const taskSchema = z.object({
   title: z.string().min(1).max(120),
   description: z.string().max(2000).optional(),
   status: z.enum(['todo', 'in_progress', 'done', 'blocked']).default('todo'),
   durationDays: z.number().int().min(1).max(365).default(1),
-  assigneeId: z.string().nullable().optional(),
+  assigneeIds: z.array(z.string()).default([]),
   subtasksJson: z.string().optional(),
   commentsJson: z.string().optional(),
   dependencyIds: z.array(z.string()).default([]),
@@ -30,13 +31,14 @@ export async function GET(_: Request, { params }: { params: { projectId: string 
 
   const tasks = await prisma.task.findMany({
     where: { projectId: params.projectId },
-    include: { dependencies: true },
+    include: { dependencies: true, assignees: true },
     orderBy: { createdAt: 'asc' },
   })
   return NextResponse.json({
     tasks: tasks.map((task) => ({
       ...task,
       dependencyIds: task.dependencies.map((dep) => dep.dependsOnTaskId),
+      assigneeIds: task.assignees.map((row) => row.userId),
     })),
   })
 }
@@ -48,6 +50,13 @@ export async function POST(request: Request, { params }: { params: { projectId: 
 
   try {
     const payload = taskSchema.parse(await request.json())
+    const project = await prisma.project.findUnique({ where: { id: params.projectId }, select: { ownerId: true } })
+    if (!project) return NextResponse.json({ error: 'Project not found.' }, { status: 404 })
+
+    const members = await prisma.projectMember.findMany({ where: { projectId: params.projectId }, select: { userId: true } })
+    const allowedAssignees = new Set<string>([project.ownerId, ...members.map((m) => m.userId)])
+    const assigneeIds = Array.from(new Set(payload.assigneeIds)).filter((id) => allowedAssignees.has(id))
+
     const created = await prisma.task.create({
       data: {
         projectId: params.projectId,
@@ -55,13 +64,19 @@ export async function POST(request: Request, { params }: { params: { projectId: 
         description: payload.description,
         status: payload.status,
         durationDays: payload.durationDays,
-        assigneeId: payload.assigneeId ?? undefined,
+        assigneeId: assigneeIds[0] ?? null,
         subtasksJson: payload.subtasksJson ?? '[]',
         commentsJson: payload.commentsJson ?? '[]',
         positionX: payload.positionX ?? undefined,
         positionY: payload.positionY ?? undefined,
       },
     })
+
+    if (assigneeIds.length > 0) {
+      await prisma.taskAssignment.createMany({
+        data: assigneeIds.map((userId) => ({ taskId: created.id, userId })),
+      })
+    }
 
     if (payload.dependencyIds.length > 0) {
       const tasks = await prisma.task.findMany({ where: { projectId: params.projectId }, select: { id: true } })
@@ -75,7 +90,18 @@ export async function POST(request: Request, { params }: { params: { projectId: 
       }
     }
 
-    return NextResponse.json({ task: created })
+    publishProjectEvent(params.projectId, {
+      type: 'task_created',
+      taskId: created.id,
+      at: Date.now(),
+    })
+
+    return NextResponse.json({
+      task: {
+        ...created,
+        assigneeIds,
+      },
+    })
   } catch (err: any) {
     if (err?.name === 'ZodError') return NextResponse.json({ error: 'Invalid request.' }, { status: 400 })
     console.error(err)

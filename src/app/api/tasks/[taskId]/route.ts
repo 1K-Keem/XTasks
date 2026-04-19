@@ -5,13 +5,14 @@ import { authOptions } from '../../../../lib/auth'
 import { prisma } from '../../../../lib/prisma'
 import { wouldCreateCycle } from '../../../../lib/dag'
 import { canAccessProject, canEditTask, getProjectRole } from '../../../../lib/project-access'
+import { publishProjectEvent } from '../../../../lib/realtime'
 
 const updateSchema = z.object({
   title: z.string().min(1).max(120).optional(),
   description: z.string().max(2000).nullable().optional(),
   status: z.enum(['todo', 'in_progress', 'done', 'blocked']).optional(),
   durationDays: z.number().int().min(1).max(365).optional(),
-  assigneeId: z.string().nullable().optional(),
+  assigneeIds: z.array(z.string()).optional(),
   subtasksJson: z.string().optional(),
   commentsJson: z.string().optional(),
   dependencyIds: z.array(z.string()).optional(),
@@ -22,7 +23,7 @@ const updateSchema = z.object({
 async function getTaskForUser(taskId: string, userId: string) {
   const task = await prisma.task.findUnique({
     where: { id: taskId },
-    include: { project: true },
+    include: { project: true, assignees: true },
   })
   if (!task) return null
   const ok = await canAccessProject(task.projectId, userId)
@@ -38,23 +39,40 @@ export async function PATCH(request: Request, { params }: { params: { taskId: st
   const found = await getTaskForUser(params.taskId, session.user.id)
   if (!found) return NextResponse.json({ error: 'Not found' }, { status: 404 })
   const { task, role } = found
-  if (!canEditTask(role, task.assigneeId, session.user.id)) {
+  if (!canEditTask(role, task.assignees.map((row) => row.userId), session.user.id)) {
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
   }
 
   try {
     const payload = updateSchema.parse(await request.json())
-    const { dependencyIds, ...patch } = payload
+    const { dependencyIds, assigneeIds, ...patch } = payload
+
+    const project = await prisma.project.findUnique({ where: { id: task.projectId }, select: { ownerId: true } })
+    if (!project) return NextResponse.json({ error: 'Project not found.' }, { status: 404 })
+    const members = await prisma.projectMember.findMany({ where: { projectId: task.projectId }, select: { userId: true } })
+    const allowedAssignees = new Set<string>([project.ownerId, ...members.map((m) => m.userId)])
+    const normalizedAssigneeIds = assigneeIds
+      ? Array.from(new Set(assigneeIds)).filter((id) => allowedAssignees.has(id))
+      : undefined
 
     const updated = await prisma.task.update({
       where: { id: params.taskId },
       data: {
         ...patch,
-        assigneeId: payload.assigneeId === null ? null : payload.assigneeId,
+        assigneeId: normalizedAssigneeIds ? (normalizedAssigneeIds[0] ?? null) : undefined,
         positionX: payload.positionX === undefined ? undefined : payload.positionX,
         positionY: payload.positionY === undefined ? undefined : payload.positionY,
       },
     })
+
+    if (normalizedAssigneeIds) {
+      await prisma.taskAssignment.deleteMany({ where: { taskId: params.taskId } })
+      if (normalizedAssigneeIds.length > 0) {
+        await prisma.taskAssignment.createMany({
+          data: normalizedAssigneeIds.map((userId) => ({ taskId: params.taskId, userId })),
+        })
+      }
+    }
 
     if (dependencyIds) {
       const tasks = await prisma.task.findMany({
@@ -79,7 +97,18 @@ export async function PATCH(request: Request, { params }: { params: { taskId: st
       }
     }
 
-    return NextResponse.json({ task: updated })
+    publishProjectEvent(task.projectId, {
+      type: 'task_updated',
+      taskId: params.taskId,
+      at: Date.now(),
+    })
+
+    return NextResponse.json({
+      task: {
+        ...updated,
+        assigneeIds: normalizedAssigneeIds ?? task.assignees.map((row) => row.userId),
+      },
+    })
   } catch (err: unknown) {
     if (err && typeof err === 'object' && (err as { name?: string }).name === 'ZodError') {
       return NextResponse.json({ error: 'Invalid request.' }, { status: 400 })
@@ -96,10 +125,15 @@ export async function DELETE(_: Request, { params }: { params: { taskId: string 
   const found = await getTaskForUser(params.taskId, session.user.id)
   if (!found) return NextResponse.json({ error: 'Not found' }, { status: 404 })
   const { task, role } = found
-  if (!canEditTask(role, task.assigneeId, session.user.id)) {
+  if (!canEditTask(role, task.assignees.map((row) => row.userId), session.user.id)) {
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
   }
 
   await prisma.task.delete({ where: { id: params.taskId } })
+  publishProjectEvent(task.projectId, {
+    type: 'task_deleted',
+    taskId: params.taskId,
+    at: Date.now(),
+  })
   return NextResponse.json({ ok: true })
 }

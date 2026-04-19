@@ -4,10 +4,20 @@ import { z } from 'zod'
 import { authOptions } from '../../../../../lib/auth'
 import { prisma } from '../../../../../lib/prisma'
 import { canAccessProject, canManageMembers, getProjectRole } from '../../../../../lib/project-access'
+import { publishProjectEvent } from '../../../../../lib/realtime'
 
 const inviteSchema = z.object({
   email: z.string().email(),
   role: z.enum(['member', 'lead']).default('member'),
+})
+
+const removeMemberSchema = z.object({
+  userId: z.string().min(1),
+})
+
+const updateRoleSchema = z.object({
+  userId: z.string().min(1),
+  role: z.enum(['member', 'lead']),
 })
 
 export async function GET(_: Request, { params }: { params: { projectId: string } }) {
@@ -87,21 +97,139 @@ export async function POST(request: Request, { params }: { params: { projectId: 
       })
     }
 
-    const created = await prisma.projectMember.create({
-      data: {
-        projectId: params.projectId,
-        userId: invitee.id,
-        role: payload.role,
+    const invite = await prisma.projectInvite.upsert({
+      where: {
+        projectId_inviteeId: {
+          projectId: params.projectId,
+          inviteeId: invitee.id,
+        },
       },
+      create: {
+        projectId: params.projectId,
+        inviteeId: invitee.id,
+        invitedById: session.user.id,
+        role: payload.role,
+        status: 'pending',
+      },
+      update: {
+        invitedById: session.user.id,
+        role: payload.role,
+        status: 'pending',
+        respondedAt: null,
+      },
+      include: { invitee: true },
+    })
+
+    return NextResponse.json({
+      invited: {
+        id: invite.invitee.id,
+        name: invite.invitee.name ?? invite.invitee.email,
+        email: invite.invitee.email,
+        role: invite.role,
+      },
+      pending: true,
+    })
+  } catch (err: unknown) {
+    if (err && typeof err === 'object' && (err as { name?: string }).name === 'ZodError') {
+      return NextResponse.json({ error: 'Invalid request.' }, { status: 400 })
+    }
+    console.error(err)
+    return NextResponse.json({ error: 'Internal server error.' }, { status: 500 })
+  }
+}
+
+export async function DELETE(request: Request, { params }: { params: { projectId: string } }) {
+  const session = await getServerSession(authOptions)
+  if (!session?.user?.id) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+
+  const role = await getProjectRole(params.projectId, session.user.id)
+  if (!canManageMembers(role)) return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+
+  try {
+    const payload = removeMemberSchema.parse(await request.json())
+    const project = await prisma.project.findUnique({ where: { id: params.projectId } })
+    if (!project) return NextResponse.json({ error: 'Not found' }, { status: 404 })
+    if (payload.userId === project.ownerId) {
+      return NextResponse.json({ error: 'Cannot remove the project owner.' }, { status: 400 })
+    }
+
+    const membership = await prisma.projectMember.findFirst({
+      where: { projectId: params.projectId, userId: payload.userId },
+    })
+    if (!membership) {
+      return NextResponse.json({ error: 'Member not found.' }, { status: 404 })
+    }
+
+    await prisma.projectMember.delete({ where: { id: membership.id } })
+    await prisma.taskAssignment.deleteMany({
+      where: {
+        userId: payload.userId,
+        task: { projectId: params.projectId },
+      },
+    })
+    await prisma.task.updateMany({
+      where: { projectId: params.projectId, assigneeId: payload.userId },
+      data: { assigneeId: null },
+    })
+
+    publishProjectEvent(params.projectId, {
+      type: 'member_removed',
+      taskId: '',
+      removedUserId: payload.userId,
+      at: Date.now(),
+    })
+
+    return NextResponse.json({ ok: true })
+  } catch (err: unknown) {
+    if (err && typeof err === 'object' && (err as { name?: string }).name === 'ZodError') {
+      return NextResponse.json({ error: 'Invalid request.' }, { status: 400 })
+    }
+    console.error(err)
+    return NextResponse.json({ error: 'Internal server error.' }, { status: 500 })
+  }
+}
+
+export async function PATCH(request: Request, { params }: { params: { projectId: string } }) {
+  const session = await getServerSession(authOptions)
+  if (!session?.user?.id) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+
+  const role = await getProjectRole(params.projectId, session.user.id)
+  if (role !== 'owner') return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+
+  try {
+    const payload = updateRoleSchema.parse(await request.json())
+    const project = await prisma.project.findUnique({ where: { id: params.projectId } })
+    if (!project) return NextResponse.json({ error: 'Not found' }, { status: 404 })
+    if (payload.userId === project.ownerId) {
+      return NextResponse.json({ error: 'Cannot change the project owner role.' }, { status: 400 })
+    }
+
+    const membership = await prisma.projectMember.findFirst({
+      where: { projectId: params.projectId, userId: payload.userId },
       include: { user: true },
+    })
+    if (!membership) {
+      return NextResponse.json({ error: 'Member not found.' }, { status: 404 })
+    }
+
+    const updated = await prisma.projectMember.update({
+      where: { id: membership.id },
+      data: { role: payload.role },
+      include: { user: true },
+    })
+
+    publishProjectEvent(params.projectId, {
+      type: 'member_role_updated',
+      taskId: '',
+      at: Date.now(),
     })
 
     return NextResponse.json({
       user: {
-        id: created.user.id,
-        name: created.user.name ?? created.user.email,
-        email: created.user.email,
-        role: created.role,
+        id: updated.user.id,
+        name: updated.user.name ?? updated.user.email ?? 'User',
+        email: updated.user.email,
+        role: updated.role,
       },
     })
   } catch (err: unknown) {

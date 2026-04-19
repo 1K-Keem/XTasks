@@ -5,12 +5,22 @@ import { signOut } from 'next-auth/react'
 type Props = {
   darkMode: boolean
   userLabel: string
+  inviteCount: number
   onCreateProject: () => void
   onJoinProject: () => void
+  onOpenInvites: () => void
   onToggleTheme: () => void
 }
 
-export default function EmptyProjectState({ darkMode, userLabel, onCreateProject, onJoinProject, onToggleTheme }: Props) {
+export default function EmptyProjectState({
+  darkMode,
+  userLabel,
+  inviteCount,
+  onCreateProject,
+  onJoinProject,
+  onOpenInvites,
+  onToggleTheme,
+}: Props) {
   const bg = darkMode
     ? 'min-h-screen bg-gradient-to-br from-slate-950 via-violet-950/40 to-slate-950 text-slate-50'
     : 'min-h-screen bg-gradient-to-br from-fuchsia-50 via-cyan-50 to-violet-100 text-slate-900'
@@ -67,6 +77,24 @@ export default function EmptyProjectState({ darkMode, userLabel, onCreateProject
               className="rounded-2xl border-2 border-cyan-400/80 bg-cyan-50 px-8 py-4 text-base font-black text-cyan-900 transition hover:scale-[1.03] dark:border-cyan-500/50 dark:bg-slate-800 dark:text-cyan-100"
             >
               Join project
+            </button>
+            <button
+              type="button"
+              onClick={onOpenInvites}
+              className={`rounded-2xl border-2 px-8 py-4 text-base font-black transition hover:scale-[1.03] ${
+                inviteCount > 0
+                  ? 'border-rose-400 bg-rose-50 text-rose-700 shadow-lg shadow-rose-500/25 dark:border-rose-500/50 dark:bg-rose-950/40 dark:text-rose-200'
+                  : 'border-amber-400/80 bg-amber-50 text-amber-900 dark:border-amber-500/50 dark:bg-slate-800 dark:text-amber-100'
+              }`}
+            >
+              <span className="inline-flex items-center gap-2">
+                Invitations
+                {inviteCount > 0 && (
+                  <span className="inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-rose-600 px-1 text-[9px] font-black leading-none text-white">
+                    {inviteCount > 99 ? '99+' : inviteCount}
+                  </span>
+                )}
+              </span>
             </button>
           </div>
         </div>

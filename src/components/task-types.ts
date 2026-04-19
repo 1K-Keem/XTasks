@@ -10,7 +10,7 @@ export type TaskNode = {
   id: string
   title: string
   duration: number
-  assigneeId: string
+  assigneeIds: string[]
   status: TaskStatus
   dependencyIds: string[]
   subtasks: Subtask[]

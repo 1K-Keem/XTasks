@@ -32,10 +32,10 @@ export async function getProjectRole(projectId: string, userId: string): Promise
   return (member?.role as ProjectRole) ?? null
 }
 
-export function canEditTask(role: ProjectRole | null, assigneeId: string | null, userId: string) {
+export function canEditTask(role: ProjectRole | null, assigneeIds: string[], userId: string) {
   if (!role) return false
   if (role === 'owner' || role === 'lead') return true
-  return assigneeId === userId
+  return assigneeIds.includes(userId)
 }
 
 export function canManageMembers(role: ProjectRole | null) {

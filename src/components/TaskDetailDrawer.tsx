@@ -17,6 +17,7 @@ type Props = {
   members: WorkspaceMember[]
   tasks: TaskNode[]
   canEdit: boolean
+  currentUserName: string
   onClose: () => void
   onPatch: (taskId: string, patch: Partial<TaskNode>) => void
   onPersist: (taskId: string, patch: Partial<TaskNode>) => void
@@ -31,6 +32,7 @@ export default function TaskDetailDrawer({
   members,
   tasks,
   canEdit,
+  currentUserName,
   onClose,
   onPatch,
   onPersist,
@@ -44,7 +46,7 @@ export default function TaskDetailDrawer({
     ? 'border-violet-600/40 bg-slate-900/95 text-slate-50 shadow-[0_0_60px_rgba(139,92,246,0.15)]'
     : 'border-fuchsia-200/80 bg-white/95 text-slate-900 shadow-2xl'
 
-  const currentMember = useMemo(() => members.find((m) => m.id === task.assigneeId), [members, task.assigneeId])
+  const assigneeSet = useMemo(() => new Set(task.assigneeIds), [task.assigneeIds])
 
   const toggleBlocker = () => {
     const next: TaskStatus = task.status === 'blocked' ? 'todo' : 'blocked'
@@ -96,25 +98,36 @@ export default function TaskDetailDrawer({
                 onBlur={() => onPersist(task.id, { duration: task.duration })}
               />
             </label>
-            <label className="block space-y-1 text-sm">
-              <span className="font-semibold">Assignee</span>
-              <select
-                className="w-full rounded-2xl border border-black/10 bg-transparent px-3 py-2"
-                value={task.assigneeId}
-                disabled={!canEdit}
-                onChange={(e) => {
-                  onPatch(task.id, { assigneeId: e.target.value })
-                  void onPersist(task.id, { assigneeId: e.target.value })
-                }}
-              >
-                {members.map((user) => (
-                  <option key={user.id} value={user.id}>
-                    {user.name}
-                    {user.role ? ` (${user.role})` : ''}
-                  </option>
-                ))}
-              </select>
-            </label>
+            <div className="block space-y-2 text-sm">
+              <p className="font-semibold">Assignees</p>
+              <div className="max-h-36 space-y-1 overflow-y-auto rounded-2xl border border-black/10 p-3">
+                {members.map((user) => {
+                  const checked = assigneeSet.has(user.id)
+                  return (
+                    <label key={user.id} className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        disabled={!canEdit}
+                        onChange={(e) => {
+                          const next = new Set(task.assigneeIds)
+                          if (e.target.checked) next.add(user.id)
+                          else next.delete(user.id)
+                          const assigneeIds = Array.from(next)
+                          onPatch(task.id, { assigneeIds })
+                          void onPersist(task.id, { assigneeIds })
+                        }}
+                      />
+                      <span>
+                        {user.name}
+                        {user.role ? ` (${user.role})` : ''}
+                      </span>
+                    </label>
+                  )
+                })}
+              </div>
+              <p className="text-xs opacity-70">Pick one or many users to collaborate on this task.</p>
+            </div>
             <label className="block space-y-1 text-sm">
               <span className="font-semibold">Status</span>
               <select
@@ -257,7 +270,7 @@ export default function TaskDetailDrawer({
                   onClick={() => {
                     const text = commentDraft.trim()
                     if (!text) return
-                    const label = currentMember?.name ?? 'Teammate'
+                    const label = currentUserName || 'Teammate'
                     const comments = [...task.comments, `${label}: ${text}`]
                     onPatch(task.id, { comments })
                     void onPersist(task.id, { comments })
