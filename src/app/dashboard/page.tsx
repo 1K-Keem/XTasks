@@ -6,79 +6,106 @@ import { prisma } from '../../lib/prisma'
 
 export const dynamic = 'force-dynamic'
 
+function mergeProjects(memberships: { projectId: string; role: string; project: { id: string; name: string } }[], owned: { id: string; name: string }[]) {
+  const byId = new Map<string, { id: string; name: string; role: string }>()
+  for (const m of memberships) {
+    byId.set(m.project.id, { id: m.project.id, name: m.project.name, role: m.role })
+  }
+  for (const p of owned) {
+    if (!byId.has(p.id)) {
+      byId.set(p.id, { id: p.id, name: p.name, role: 'owner' })
+    }
+  }
+  return Array.from(byId.values()).sort((a, b) => a.name.localeCompare(b.name))
+}
+
 export default async function DashboardPage() {
   let session
   try {
     session = await getServerSession(authOptions)
-  } catch (error) {
-    console.error('Failed to get server session:', error)
+  } catch {
     redirect('/login')
   }
   if (!session?.user?.id) redirect('/login')
 
-  console.log('session.user.id:', session.user.id)
-
-  // Check if user exists
   const user = await prisma.user.findUnique({ where: { id: session.user.id } })
   if (!user) redirect('/login')
 
-  // Get all projects the user is a member of
-  const memberships = await prisma.projectMember.findMany({
-    where: { userId: session.user.id },
-    include: { project: true },
-    orderBy: { project: { createdAt: 'asc' } },
-  })
+  const [memberships, ownedProjects] = await Promise.all([
+    prisma.projectMember.findMany({
+      where: { userId: session.user.id },
+      include: { project: true },
+      orderBy: { project: { createdAt: 'asc' } },
+    }),
+    prisma.project.findMany({
+      where: { ownerId: session.user.id },
+      orderBy: { createdAt: 'asc' },
+    }),
+  ])
 
-  const projects = memberships.map((m) => ({ id: m.project.id, name: m.project.name, role: m.role }))
+  const projects = mergeProjects(
+    memberships.map((m) => ({ projectId: m.projectId, role: m.role, project: m.project })),
+    ownedProjects,
+  )
 
-  let activeProject = memberships[0]?.project
-  if (!activeProject) {
-    // If no membership, create a new project and connect it to the existing user.
-    activeProject = await prisma.project.create({
-      data: {
-        name: 'My Project',
-        owner: { connect: { id: session.user.id } },
-      },
+  const activeProjectId = projects[0]?.id ?? ''
+
+  const tasks = activeProjectId
+    ? await prisma.task.findMany({
+        where: { projectId: activeProjectId },
+        include: { dependencies: true },
+        orderBy: { createdAt: 'asc' },
+      })
+    : []
+
+  const members = activeProjectId
+    ? await prisma.projectMember.findMany({
+        where: { projectId: activeProjectId },
+        include: { user: true },
+      })
+    : []
+
+  const projectRow = activeProjectId ? await prisma.project.findUnique({ where: { id: activeProjectId } }) : null
+
+  const rows: { id: string; name: string; email: string; role: string }[] = []
+  const seen = new Set<string>()
+  for (const m of members) {
+    seen.add(m.userId)
+    rows.push({
+      id: m.user.id,
+      name: m.user.name ?? m.user.email ?? 'User',
+      email: m.user.email,
+      role: m.role,
     })
-    // Add as owner
-    await prisma.projectMember.create({
-      data: {
-        userId: session.user.id,
-        projectId: activeProject.id,
-        role: 'owner',
-      },
-    })
-    projects.push({ id: activeProject.id, name: activeProject.name, role: 'owner' })
   }
-
-  const tasks = await prisma.task.findMany({
-    where: { projectId: activeProject.id },
-    include: { dependencies: true },
-    orderBy: { createdAt: 'asc' },
-  })
-
-  // Get all members of the project
-  const members = await prisma.projectMember.findMany({
-    where: { projectId: activeProject.id },
-    include: { user: true },
-  })
-
-  const users = members.map((m) => ({
-    id: m.user.id,
-    name: m.user.name ?? m.user.email ?? 'User',
-    role: m.role as 'owner' | 'lead' | 'member',
-  }))
-
-  // Find current user's role
-  const currentUserMember = members.find((m) => m.userId === session.user.id)
-  const currentUserRole = currentUserMember?.role ?? 'member'
+  if (projectRow && !seen.has(projectRow.ownerId)) {
+    const owner = await prisma.user.findUnique({ where: { id: projectRow.ownerId } })
+    if (owner) {
+      rows.unshift({
+        id: owner.id,
+        name: owner.name ?? owner.email ?? 'Owner',
+        email: owner.email,
+        role: 'owner',
+      })
+    }
+  }
+  if (rows.length === 0) {
+    rows.push({
+      id: session.user.id,
+      name: user.name ?? user.email ?? 'You',
+      email: user.email,
+      role: 'member',
+    })
+  }
+  const users = rows
 
   return (
     <XTasksApp
       initialProjects={projects}
-      initialActiveProjectId={activeProject.id}
+      initialActiveProjectId={activeProjectId}
       initialUsers={users}
       initialCurrentUserId={session.user.id}
+      initialCurrentUserName={user.name ?? user.email ?? 'You'}
       initialTasks={tasks.map((task) => ({
         id: task.id,
         title: task.title,
@@ -86,10 +113,24 @@ export default async function DashboardPage() {
         assigneeId: task.assigneeId ?? session.user.id,
         status: task.status as 'todo' | 'in_progress' | 'done' | 'blocked',
         dependencyIds: task.dependencies.map((dep) => dep.dependsOnTaskId),
-        subtasks: (() => { try { return JSON.parse(task.subtasksJson || '[]') as { id: string; title: string; done: boolean }[] } catch { return [] } })(),
+        subtasks: (() => {
+          try {
+            return JSON.parse(task.subtasksJson || '[]') as { id: string; title: string; done: boolean }[]
+          } catch {
+            return []
+          }
+        })(),
         notes: task.description ?? '',
-        comments: (() => { try { return JSON.parse(task.commentsJson || '[]') as string[] } catch { return [] } })(),
+        comments: (() => {
+          try {
+            return JSON.parse(task.commentsJson || '[]') as string[]
+          } catch {
+            return []
+          }
+        })(),
         createdAt: task.createdAt.getTime(),
+        positionX: task.positionX,
+        positionY: task.positionY,
       }))}
     />
   )
