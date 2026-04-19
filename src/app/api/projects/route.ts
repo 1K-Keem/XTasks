@@ -11,12 +11,30 @@ const createProjectSchema = z.object({
 export async function GET() {
   const session = await getServerSession(authOptions)
   if (!session?.user?.id) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  const memberships = await prisma.projectMember.findMany({
-    where: { userId: session.user.id },
-    include: { project: true },
-    orderBy: { project: { createdAt: 'asc' } },
-  })
-  const projects = memberships.map((m) => ({ id: m.project.id, name: m.project.name, role: m.role }))
+
+  const [memberships, ownedProjects] = await Promise.all([
+    prisma.projectMember.findMany({
+      where: { userId: session.user.id },
+      include: { project: true },
+      orderBy: { project: { createdAt: 'asc' } },
+    }),
+    prisma.project.findMany({
+      where: { ownerId: session.user.id },
+      orderBy: { createdAt: 'asc' },
+    }),
+  ])
+
+  const byId = new Map<string, { id: string; name: string; role: string }>()
+  for (const m of memberships) {
+    byId.set(m.project.id, { id: m.project.id, name: m.project.name, role: m.role })
+  }
+  for (const p of ownedProjects) {
+    if (!byId.has(p.id)) {
+      byId.set(p.id, { id: p.id, name: p.name, role: 'owner' })
+    }
+  }
+
+  const projects = Array.from(byId.values()).sort((a, b) => a.name.localeCompare(b.name))
   return NextResponse.json({ projects })
 }
 

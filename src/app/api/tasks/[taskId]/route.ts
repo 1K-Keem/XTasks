@@ -4,6 +4,7 @@ import { z } from 'zod'
 import { authOptions } from '../../../../lib/auth'
 import { prisma } from '../../../../lib/prisma'
 import { wouldCreateCycle } from '../../../../lib/dag'
+import { canAccessProject, canEditTask, getProjectRole } from '../../../../lib/project-access'
 
 const updateSchema = z.object({
   title: z.string().min(1).max(120).optional(),
@@ -14,24 +15,32 @@ const updateSchema = z.object({
   subtasksJson: z.string().optional(),
   commentsJson: z.string().optional(),
   dependencyIds: z.array(z.string()).optional(),
+  positionX: z.number().nullable().optional(),
+  positionY: z.number().nullable().optional(),
 })
 
-async function getAuthorizedTask(taskId: string, userId: string) {
+async function getTaskForUser(taskId: string, userId: string) {
   const task = await prisma.task.findUnique({
     where: { id: taskId },
     include: { project: true },
   })
   if (!task) return null
-  if (task.project.ownerId !== userId) return null
-  return task
+  const ok = await canAccessProject(task.projectId, userId)
+  if (!ok) return null
+  const role = await getProjectRole(task.projectId, userId)
+  return { task, role }
 }
 
 export async function PATCH(request: Request, { params }: { params: { taskId: string } }) {
   const session = await getServerSession(authOptions)
   if (!session?.user?.id) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
-  const task = await getAuthorizedTask(params.taskId, session.user.id)
-  if (!task) return NextResponse.json({ error: 'Not found' }, { status: 404 })
+  const found = await getTaskForUser(params.taskId, session.user.id)
+  if (!found) return NextResponse.json({ error: 'Not found' }, { status: 404 })
+  const { task, role } = found
+  if (!canEditTask(role, task.assigneeId, session.user.id)) {
+    return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+  }
 
   try {
     const payload = updateSchema.parse(await request.json())
@@ -42,6 +51,8 @@ export async function PATCH(request: Request, { params }: { params: { taskId: st
       data: {
         ...patch,
         assigneeId: payload.assigneeId === null ? null : payload.assigneeId,
+        positionX: payload.positionX === undefined ? undefined : payload.positionX,
+        positionY: payload.positionY === undefined ? undefined : payload.positionY,
       },
     })
 
@@ -69,8 +80,10 @@ export async function PATCH(request: Request, { params }: { params: { taskId: st
     }
 
     return NextResponse.json({ task: updated })
-  } catch (err: any) {
-    if (err?.name === 'ZodError') return NextResponse.json({ error: 'Invalid request.' }, { status: 400 })
+  } catch (err: unknown) {
+    if (err && typeof err === 'object' && (err as { name?: string }).name === 'ZodError') {
+      return NextResponse.json({ error: 'Invalid request.' }, { status: 400 })
+    }
     console.error(err)
     return NextResponse.json({ error: 'Internal server error.' }, { status: 500 })
   }
@@ -79,8 +92,13 @@ export async function PATCH(request: Request, { params }: { params: { taskId: st
 export async function DELETE(_: Request, { params }: { params: { taskId: string } }) {
   const session = await getServerSession(authOptions)
   if (!session?.user?.id) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  const task = await getAuthorizedTask(params.taskId, session.user.id)
-  if (!task) return NextResponse.json({ error: 'Not found' }, { status: 404 })
+
+  const found = await getTaskForUser(params.taskId, session.user.id)
+  if (!found) return NextResponse.json({ error: 'Not found' }, { status: 404 })
+  const { task, role } = found
+  if (!canEditTask(role, task.assigneeId, session.user.id)) {
+    return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+  }
 
   await prisma.task.delete({ where: { id: params.taskId } })
   return NextResponse.json({ ok: true })

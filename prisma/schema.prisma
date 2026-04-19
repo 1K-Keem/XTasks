@@ -50,6 +50,9 @@ model Task {
   assigneeId   String?
   assignee     User?        @relation("TaskAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
   durationDays Int          @default(1)
+  /// Canvas coordinates for React Flow (nullable = use auto layout)
+  positionX    Float?
+  positionY    Float?
   subtasksJson String       @default("[]")
   commentsJson String       @default("[]")
   createdAt    DateTime     @default(now())

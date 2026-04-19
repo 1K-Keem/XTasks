@@ -4,6 +4,7 @@ import { z } from 'zod'
 import { authOptions } from '../../../../../lib/auth'
 import { prisma } from '../../../../../lib/prisma'
 import { wouldCreateCycle } from '../../../../../lib/dag'
+import { canAccessProject } from '../../../../../lib/project-access'
 
 const taskSchema = z.object({
   title: z.string().min(1).max(120),
@@ -14,13 +15,12 @@ const taskSchema = z.object({
   subtasksJson: z.string().optional(),
   commentsJson: z.string().optional(),
   dependencyIds: z.array(z.string()).default([]),
+  positionX: z.number().nullable().optional(),
+  positionY: z.number().nullable().optional(),
 })
 
 async function canAccess(projectId: string, userId: string) {
-  const member = await prisma.projectMember.findFirst({
-    where: { projectId, userId },
-  })
-  return !!member
+  return canAccessProject(projectId, userId)
 }
 
 export async function GET(_: Request, { params }: { params: { projectId: string } }) {
@@ -58,6 +58,8 @@ export async function POST(request: Request, { params }: { params: { projectId: 
         assigneeId: payload.assigneeId ?? undefined,
         subtasksJson: payload.subtasksJson ?? '[]',
         commentsJson: payload.commentsJson ?? '[]',
+        positionX: payload.positionX ?? undefined,
+        positionY: payload.positionY ?? undefined,
       },
     })
 
