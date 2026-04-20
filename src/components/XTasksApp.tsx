@@ -232,6 +232,7 @@ export default function XTasksApp({
   const [inviteCount, setInviteCount] = useState(0)
   const [interactionLocked, setInteractionLocked] = useState(false)
   const rolePanelRef = useRef<HTMLDivElement | null>(null)
+  const suppressTaskRefreshRef = useRef(false)
 
   const refreshProjects = useCallback(async () => {
     const res = await fetch('/api/projects')
@@ -340,8 +341,13 @@ export default function XTasksApp({
     let refreshTimer: ReturnType<typeof setTimeout> | null = null
 
     const scheduleRefresh = () => {
+      if (suppressTaskRefreshRef.current) return
       if (refreshTimer) return
       refreshTimer = setTimeout(() => {
+        if (suppressTaskRefreshRef.current) {
+          refreshTimer = null
+          return
+        }
         refreshTimer = null
         void refreshTasks()
       }, 120)
@@ -507,9 +513,19 @@ export default function XTasksApp({
     })
 
     dispatch({ type: 'loadTasks', tasks })
-    for (const [taskId, pos] of Object.entries(positions)) {
-      void persistTask(taskId, { positionX: pos.x, positionY: pos.y })
-    }
+
+    const entries = Object.entries(positions)
+    if (entries.length === 0) return
+
+    suppressTaskRefreshRef.current = true
+    void (async () => {
+      try {
+        await Promise.all(entries.map(([taskId, pos]) => persistTask(taskId, { positionX: pos.x, positionY: pos.y })))
+      } finally {
+        suppressTaskRefreshRef.current = false
+        void refreshTasks()
+      }
+    })()
   }
 
   const clearAllTasksRemote = async () => {

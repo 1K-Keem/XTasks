@@ -60,6 +60,30 @@ function layoutFallback(tasks: TaskNode[]) {
 
   const baseLevelById = { ...levelById }
 
+  // Place tasks as late as possible while preserving DAG constraints.
+  // This keeps predecessors visually close to their successors when there is slack.
+  const maxBaseLevel = Math.max(0, ...Object.values(baseLevelById))
+  const latestLevelById: Record<string, number> = {}
+  const tasksByBaseLevel = [...tasks].sort(
+    (a, b) => (baseLevelById[a.id] ?? 0) - (baseLevelById[b.id] ?? 0),
+  )
+
+  for (const task of [...tasksByBaseLevel].reverse()) {
+    const children = (childrenById.get(task.id) ?? []).filter((childId) => taskById.has(childId))
+    if (children.length === 0) {
+      latestLevelById[task.id] = maxBaseLevel
+      continue
+    }
+    const latestAllowed = Math.min(
+      ...children.map((childId) => (latestLevelById[childId] ?? maxBaseLevel) - 1),
+    )
+    latestLevelById[task.id] = latestAllowed
+  }
+
+  for (const task of tasks) {
+    levelById[task.id] = Math.max(baseLevelById[task.id] ?? 0, latestLevelById[task.id] ?? 0)
+  }
+
   const longestPathById: Record<string, number> = {}
   const longestVisiting = new Set<string>()
   const getLongestPath = (taskId: string): number => {
@@ -77,39 +101,6 @@ function layoutFallback(tasks: TaskNode[]) {
   }
   for (const task of tasks) {
     getLongestPath(task.id)
-  }
-
-  // Compact merge inputs: promote shallow dependencies closer to their child level.
-  // Example: 1->2->3->4 and 5->4 => move 5 close to 3's column.
-  let changed = true
-  while (changed) {
-    changed = false
-    for (const task of tasks) {
-      const taskLevel = levelById[task.id] ?? 0
-      if (task.dependencyIds.length <= 1) continue
-      const desiredDependencyLevel = Math.max(0, taskLevel - 1)
-      for (const depId of task.dependencyIds) {
-        const dep = tasks.find((t) => t.id === depId)
-        if (!dep) continue
-        const currentLevel = levelById[dep.id] ?? 0
-        if (currentLevel < desiredDependencyLevel) {
-          levelById[dep.id] = desiredDependencyLevel
-          changed = true
-        }
-      }
-    }
-
-    // Re-validate DAG level constraints after promotion.
-    for (const task of tasks) {
-      const maxDep = task.dependencyIds.length
-        ? Math.max(...task.dependencyIds.map((depId) => levelById[depId] ?? 0))
-        : -1
-      const required = maxDep + 1
-      if ((levelById[task.id] ?? 0) < required) {
-        levelById[task.id] = required
-        changed = true
-      }
-    }
   }
 
   const byLevel: Record<number, TaskNode[]> = {}
@@ -135,37 +126,96 @@ function layoutFallback(tasks: TaskNode[]) {
 
   const taskSort = (a: TaskNode, b: TaskNode) =>
     (longestPathById[b.id] ?? 1) - (longestPathById[a.id] ?? 1) ||
-    (baseLevelById[b.id] ?? 0) - (baseLevelById[a.id] ?? 0) ||
+    a.dependencyIds.length - b.dependencyIds.length ||
+    (baseLevelById[a.id] ?? 0) - (baseLevelById[b.id] ?? 0) ||
     a.title.localeCompare(b.title)
 
+  // Initialize per-level order, then reduce crossings with barycenter sweeps.
   for (const level of sortedLevels) {
-    const levelTasks = [...(byLevel[level] ?? [])].sort(taskSort)
-    for (const task of levelTasks) {
-      if (task.dependencyIds.length === 0) {
-        const lane = reserveLane(level, nextFreeLane)
-        laneById.set(task.id, lane)
-        nextFreeLane = Math.max(nextFreeLane, lane + 1)
-        continue
-      }
+    byLevel[level] = [...(byLevel[level] ?? [])].sort(taskSort)
+  }
 
-      const depLanes = task.dependencyIds
-        .map((depId) => laneById.get(depId))
-        .filter((lane): lane is number => lane != null)
+  for (const level of sortedLevels) {
+    const levelTasks = byLevel[level] ?? []
+    levelTasks.forEach((task, index) => {
+      laneById.set(task.id, index)
+    })
+  }
 
-      let preferredLane = nextFreeLane
-      if (depLanes.length === 1) {
-        preferredLane = depLanes[0]
-      } else if (depLanes.length > 1) {
-        const minDepLane = Math.min(...depLanes)
-        const maxDepLane = Math.max(...depLanes)
-        preferredLane = (minDepLane + maxDepLane) / 2
-      }
+  const average = (values: number[]) => values.reduce((sum, value) => sum + value, 0) / values.length
+  const getParentCenter = (task: TaskNode) => {
+    const parentLanes = task.dependencyIds
+      .map((depId) => laneById.get(depId))
+      .filter((lane): lane is number => lane != null)
+    return parentLanes.length > 0 ? average(parentLanes) : laneById.get(task.id) ?? 0
+  }
+  const getChildCenter = (task: TaskNode) => {
+    const childLanes = (childrenById.get(task.id) ?? [])
+      .map((childId) => laneById.get(childId))
+      .filter((lane): lane is number => lane != null)
+    return childLanes.length > 0 ? average(childLanes) : laneById.get(task.id) ?? 0
+  }
 
-      const lane = reserveLane(level, preferredLane)
-      laneById.set(task.id, lane)
-      nextFreeLane = Math.max(nextFreeLane, lane + 1)
+  const sweepCount = 4
+  for (let sweep = 0; sweep < sweepCount; sweep += 1) {
+    for (const level of sortedLevels) {
+      const ordered = [...(byLevel[level] ?? [])].sort((a, b) => getParentCenter(a) - getParentCenter(b) || taskSort(a, b))
+      byLevel[level] = ordered
+      ordered.forEach((task, index) => laneById.set(task.id, index))
     }
-    byLevel[level] = levelTasks
+
+    for (const level of [...sortedLevels].reverse()) {
+      const ordered = [...(byLevel[level] ?? [])].sort((a, b) => getChildCenter(a) - getChildCenter(b) || taskSort(a, b))
+      byLevel[level] = ordered
+      ordered.forEach((task, index) => laneById.set(task.id, index))
+    }
+  }
+
+  // Refine lane positions: place a task near the center of its dependencies.
+  const laneFloatById = new Map<string, number>()
+  for (const level of sortedLevels) {
+    const levelTasks = byLevel[level] ?? []
+    for (const task of levelTasks) {
+      laneFloatById.set(task.id, laneById.get(task.id) ?? 0)
+    }
+  }
+
+  for (let pass = 0; pass < 3; pass += 1) {
+    for (const level of sortedLevels) {
+      const levelTasks = byLevel[level] ?? []
+      for (const task of levelTasks) {
+        if (task.dependencyIds.length === 0) continue
+        const parentLanes = task.dependencyIds
+          .map((depId) => laneFloatById.get(depId))
+          .filter((lane): lane is number => lane != null)
+        if (parentLanes.length === 0) continue
+        laneFloatById.set(task.id, average(parentLanes))
+      }
+
+      const orderedByLane = [...levelTasks].sort(
+        (a, b) => (laneFloatById.get(a.id) ?? 0) - (laneFloatById.get(b.id) ?? 0),
+      )
+
+      const minGap = 1
+      for (let i = 1; i < orderedByLane.length; i += 1) {
+        const prevId = orderedByLane[i - 1].id
+        const currId = orderedByLane[i].id
+        const prevLane = laneFloatById.get(prevId) ?? 0
+        const currLane = laneFloatById.get(currId) ?? 0
+        if (currLane < prevLane + minGap) {
+          laneFloatById.set(currId, prevLane + minGap)
+        }
+      }
+      for (let i = orderedByLane.length - 2; i >= 0; i -= 1) {
+        const nextId = orderedByLane[i + 1].id
+        const currId = orderedByLane[i].id
+        const nextLane = laneFloatById.get(nextId) ?? 0
+        const currLane = laneFloatById.get(currId) ?? 0
+        if (currLane > nextLane - minGap) {
+          laneFloatById.set(currId, nextLane - minGap)
+        }
+      }
+    }
   }
 
   const gapX = 360
@@ -174,7 +224,7 @@ function layoutFallback(tasks: TaskNode[]) {
   for (const level of sortedLevels) {
     const levelTasks = byLevel[level] ?? []
     for (const task of levelTasks) {
-      const lane = laneById.get(task.id) ?? 0
+      const lane = laneFloatById.get(task.id) ?? laneById.get(task.id) ?? 0
       pos[task.id] = {
         x: 40 + level * gapX,
         y: 40 + lane * gapY,
